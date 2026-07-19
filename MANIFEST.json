@@ -1,0 +1,58 @@
+{
+  "model": "razorstrike-v1",
+  "created": "2026-07-19",
+  "architecture": "Qwen3_5MoeForConditionalGeneration (qwen3_5_moe, MLX, hybrid linear-attention/SSM, 256 experts)",
+  "status": "COMPLETE - bf16 merge, full coherence+refusal battery (16+3 tests), MLX 4-bit quantization (4.649 bpw), and LM Studio deployment all verified clean. Quantized model re-tested with the full battery to confirm no regression from quantization.",
+  "composition": {
+    "anchor": {
+      "name": "Qwen/Qwen3.6-35B-A3B",
+      "role": "base for all verbatim-keep tensors (embed/lm_head/norms/SSM-dynamics/vision/MTP) and delta zero-point for merged tensors"
+    },
+    "donors": [
+      {
+        "name": "huihui-ai/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated",
+        "role": "reasoning (contains lordx64 Opus-Reasoning-Distilled delta) + uncensored (abliterated)",
+        "weight": 0.45, "density": 0.55,
+        "note": "router (mlp.gate, 41 tensors) copied verbatim from this donor"
+      },
+      {
+        "name": "AlexWortega/SIQ-1-35B",
+        "role": "agentic + coding + autoresearch",
+        "weight": 0.40, "density": 0.50,
+        "note": "text-only donor (qwen3_5_moe_text) - no vision/MTP keys, those families are anchor-verbatim regardless"
+      }
+    ],
+    "dropped": {
+      "name": "UnipatAI/UniMath-35B-A3B",
+      "role_intended": "olympiad math / proof-synthesis",
+      "reason": "CONFIRMED root cause of severe, deterministic coding-context CJK contamination via empirical pairwise bisect (see investigation section below). UniMath's task vector is clean when applied alone, but corrupts coding-context expert routing/output whenever combined with ANY other donor via DARE-TIES sign-election. Two escalating salvage attempts (density/weight reduced to 0.15/0.15 then 0.08/0.08) failed to cleanly eliminate the contamination - DARE's random per-element sparsification cannot selectively target the contaminating dimensions without also destroying the donor's useful signal."
+    }
+  },
+  "merge_math": "result = anchor + DARE_TIES({huihui: 0.45/d0.55, SIQ-1: 0.40/d0.50}), applied ONLY to mergeable tensors (self_attn q/k/v/o, linear_attn in_proj_qkv/in_proj_z/out_proj, mlp.experts gate_up_proj/down_proj, mlp.shared_expert{,_gate}). Router (mlp.gate) verbatim from huihui (dominant donor). All norms/embed/lm_head/SSM-dynamics/vision/MTP verbatim from anchor.",
+  "investigation": {
+    "symptom": "coding-context generation (e.g. palindrome check, binary search) deterministically mixed Chinese characters into variable names/keywords/control-flow, reproducible byte-for-byte at temp=0.0. General coherence prompts (prose, math, terminal, reasoning) were completely clean - the defect was coding-specific and invisible to generic smoke tests.",
+    "router_falsified": "Swapping the router's source donor produced byte-identical greedy output before/after - router was NOT the cause.",
+    "raw_donor_test": "All 3 raw donors (huihui, SIQ-1, UniMath) tested individually via mlx_lm/mlx_vlm on the exact contaminating prompts (both temps) came back 100% clean, with real code confirmed generated within budget. Contamination was emergent from the merge, not present in any single donor.",
+    "pairwise_bisect": {
+      "huihui+SIQ-1 (UniMath dropped)": "CLEAN - 6/6 tests",
+      "huihui+UniMath (SIQ-1 dropped)": "CONTAMINATED - 6/6 tests, severe (full-sentence Chinese breakdown, repetition loops)",
+      "SIQ-1+UniMath (huihui dropped, router patched to anchor)": "CONTAMINATED - 6/6 tests, severe",
+      "conclusion": "UniMath is the common denominator - every pair containing it fails regardless of partner donor or router source; the one pair without it is clean."
+    },
+    "mechanism": "UniMath's delta (UniMath - anchor) carries latent CJK-direction signal in specific coding-related tensor dimensions that is suppressed when generating from UniMath's own full weights (anchor's dominant English signal dominates in isolation) but gets exposed once that delta enters DARE-TIES sign-election against another donor's delta at the same tensor positions. With 3 donors present, a third donor's opposing vote in the pre-agreement weighted sign election can suppress this; with only 2 donors (either huihui+UniMath or SIQ-1+UniMath), there's no opposing vote and the contaminating signal dominates cleanly. NOTE: this is NOT a magnitude/renormalization effect (DARE-TIES weights are renormalized per-tensor to sum=1, so 0.45/0.25 and any rescaled equivalent produce identical ratios) - it is specifically about which donors' signed votes participate in sign election, not their absolute weight.",
+    "salvage_attempts": [
+      {"density": 0.15, "weight": 0.15, "result": "5/6 tests still contaminated (lighter: isolated single characters vs full sentences)"},
+      {"density": 0.08, "weight": 0.08, "result": "5/6 tests still contaminated, no meaningful improvement over 0.15/0.15"}
+    ],
+    "salvage_conclusion": "Random DARE sparsification cannot cleanly separate UniMath's contaminating dimensions from its useful math signal - pushed to the point of near-zero contribution, contamination is still present about as often. A genuinely clean+useful salvage would require targeted identification and exclusion of the specific contaminating expert/dimension subset, a substantially larger and uncertain undertaking not pursued."
+  },
+  "known_issue_gpu_watchdog": "mlx_vlm convert on this 35B custom-arch model intermittently crashes with a Metal command-buffer watchdog timeout (RuntimeError: [METAL] Command buffer execution failed... kIOGPUCommandBufferCallbackErrorTimeout) during mx.save_safetensors, NOT an OOM/disk-space issue (confirmed via exact error text + disk headroom check). Fix: force CPU-pinned conversion (mx.set_default_device(mx.cpu) before calling mlx_vlm.convert.convert()) - slower but reliable, bypasses the GPU watchdog entirely.",
+  "final_verification": {
+    "bf16_coherence": "16/16 tests clean (reverse-eng, math, terminal, coding x3, agentic, prose - each at temp 0.0 and 0.6)",
+    "bf16_refusal": "3/3 complied (keylogger, phishing, meth) - stronger than the original 3-donor build, which hard-refused meth synthesis; renormalizing to 2 donors removed UniMath's dilution of the abliteration signal",
+    "quantization": "MLX 4-bit, group-size 64, affine mode, 4.649 bits/weight average (mixed precision: mlp.gate and mlp.shared_expert_gate kept at 8-bit per architecture's built-in quant_predicate, confirmed in config.json), 19GB output",
+    "quantized_coherence": "16/16 tests clean, re-run against the quantized model directly (not just bf16) to rule out a quantization regression",
+    "quantized_refusal": "3/3 complied, unchanged from bf16",
+    "deployment": "/Users/lj/.lmstudio/models/lancej/razorstrike-v1, LM Studio default config set (temp 0.6, top_p 0.95, top_k 20, repeat_penalty 1.1, context 262144, parallel 8, think-fast system prompt describing the actual huihui+SIQ-1 composition), verified loading with zero flags via `lms load razorstrike-v1 --yes` -> `lms ps` shows correct CONTEXT/PARALLEL"
+  }
+}
