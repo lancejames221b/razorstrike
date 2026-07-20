@@ -72,8 +72,15 @@ def _patch_transformers_bnb_oom():
     # double-registered a weight-conversion mapping and broke MoE checkpoint
     # loading with an unrelated "many-to-many" ValueError - do not regress to
     # that approach.)
+    # The original file has `from __future__ import annotations` (PEP 563),
+    # so its type annotations (e.g. `model: PreTrainedModel`) are lazy strings
+    # never evaluated at runtime. Extracting just this function's text loses
+    # that directive, so plain compile() would eagerly evaluate the
+    # annotation and NameError on names only imported under TYPE_CHECKING
+    # (confirmed: PreTrainedModel is exactly such a name). Prepend the same
+    # future-import to restore the original file's compilation semantics.
     import textwrap
-    dedented = textwrap.dedent(patched)
+    dedented = "from __future__ import annotations\n" + textwrap.dedent(patched)
     local_ns = {}
     exec(compile(dedented, cml.__file__, "exec"), cml.__dict__, local_ns)
     cml.convert_and_load_state_dict_in_model = local_ns["convert_and_load_state_dict_in_model"]
