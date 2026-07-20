@@ -118,7 +118,7 @@ def _patch_materialize_copy_oom_retry():
         + "        except torch.OutOfMemoryError:\n"
         "            if device is None or str(device) == 'cpu':\n"
         "                raise\n"
-        "            torch.cuda.empty_cache()\n"
+        "            import gc; gc.collect(); torch.cuda.empty_cache()\n"
         "            tensor = tensor.to(device='cpu', dtype=dtype)  # patched: OOM retry, transformers#43032\n",
         1)
     import textwrap
