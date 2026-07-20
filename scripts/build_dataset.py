@@ -79,8 +79,6 @@ def build_combined(cap=0, push=False):
             if label in CAPS and len(rows) > CAPS[label]:
                 random.seed(SHUFFLE_SEED)
                 rows = random.sample(rows, CAPS[label])
-            if UPSAMPLE.get(label, 1) > 1:
-                rows = rows * UPSAMPLE[label]
             for r in rows:
                 r.setdefault("family", label)
                 r["family_value"] = FAMILY_VALUES.get(r.get("family", label),
@@ -96,10 +94,21 @@ def build_combined(cap=0, push=False):
         raise RuntimeError(f"family builders failed: {failures}")
 
     random.seed(SHUFFLE_SEED)
-    random.shuffle(all_rows)  # in place; do NOT reassign (returns None)
+    random.shuffle(all_rows)  # unique rows only at this point (no dup copies yet)
 
     n_val = max(1, int(len(all_rows) * VAL_FRACTION))
     val_rows, train_rows = all_rows[:n_val], all_rows[n_val:]
+
+    # Upsample the v2-critical families in TRAIN ONLY - never in val (no leakage).
+    extra = []
+    for r in train_rows:
+        f = UPSAMPLE.get(r.get("family"), 1)
+        if f > 1:
+            extra.extend([r] * (f - 1))
+    if extra:
+        train_rows = train_rows + extra
+        random.seed(SHUFFLE_SEED + 1)
+        random.shuffle(train_rows)
 
     ds_out = DatasetDict({
         "train": Dataset.from_list(train_rows),
