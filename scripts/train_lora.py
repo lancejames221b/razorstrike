@@ -47,11 +47,14 @@ def _patch_transformers_bnb_oom():
     src = inspect.getsource(cml)
     anchor = "            materialize_device = param_device\n"
     n = src.count(anchor)
-    if n != 1:
-        print(f"[patch] transformers#43032 workaround SKIPPED: expected 1 anchor "
-              f"match, found {n} (transformers version drifted from 5.14.1 - "
-              f"verify the OOM is actually fixed, or the bug reproduces again)")
-        return False
+    assert n == 1, (
+        f"[patch] transformers#43032 workaround FAILED: expected exactly 1 anchor "
+        f"match for 'materialize_device = param_device', found {n}. transformers "
+        f"version has drifted from the pinned 5.14.1 this patch was verified "
+        f"against - loading now would silently reproduce the 35B QLoRA OOM after "
+        f"a long download. Re-verify the fix against the installed version "
+        f"(transformers.__version__: {__import__('transformers').__version__}) "
+        f"before proceeding.")
     patched = src.replace(
         anchor,
         anchor + "            if mapping.quantization_operation is not None:\n"
