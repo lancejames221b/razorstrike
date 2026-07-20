@@ -18,12 +18,51 @@ Reads env: BASE_REPO, DATA_REPO, OUT_DIR, ADAPTER_REPO, HF_TOKEN,
   MAXLEN(4096), TARGET_MLP(0), LORA_R(32), LORA_ALPHA(64), RESUME.
 """
 
-import os, torch
-from transformers import (AutoModelForImageTextToText, AutoModelForCausalLM,
+import os, torch, inspect
+from transformers import (AutoModelForImageTextToText,
                           AutoTokenizer, BitsAndBytesConfig,
                           Trainer, TrainingArguments, DataCollatorForSeq2Seq)
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_dataset
+
+
+def _patch_transformers_bnb_oom():
+    """Runtime monkeypatch for a confirmed, still-open transformers v5 regression
+    (huggingface/transformers#43032, reproduced against installed 5.14.1): during
+    core_model_loading, parameters that WILL be quantized are still materialized
+    on the target GPU at full precision BEFORE the quantize step runs, causing an
+    OOM on GPUs that would otherwise easily fit the 4-bit model (a 35B model needs
+    ~70GB to materialize in bf16 vs ~20GB once quantized to 4-bit).
+
+    Verified fix (from the issue reporter, confirmed against our exact installed
+    source at the `materialize_device = param_device` line): materialize
+    quantized params on CPU first; the quantizer's own convert() step still
+    places the final compressed tensor on the target GPU device correctly.
+
+    Patches transformers.core_model_loading's source IN-MEMORY at process start
+    (not the on-disk package), so it re-applies automatically on every launch -
+    including a fresh VM after a reclaim/RESUME - with no persistent VM state.
+    """
+    import transformers.core_model_loading as cml
+    src = inspect.getsource(cml)
+    anchor = "            materialize_device = param_device\n"
+    n = src.count(anchor)
+    if n != 1:
+        print(f"[patch] transformers#43032 workaround SKIPPED: expected 1 anchor "
+              f"match, found {n} (transformers version drifted from 5.14.1 - "
+              f"verify the OOM is actually fixed, or the bug reproduces again)")
+        return False
+    patched = src.replace(
+        anchor,
+        anchor + "            if mapping.quantization_operation is not None:\n"
+                 "                materialize_device = 'cpu'  # patched: avoid pre-quant GPU OOM, transformers#43032\n",
+        1)
+    exec(compile(patched, cml.__file__, "exec"), cml.__dict__)
+    print("[patch] applied transformers#43032 workaround (quantized params materialize on CPU first)")
+    return True
+
+
+_patch_transformers_bnb_oom()
 
 BASE   = os.environ["BASE_REPO"]           # Qwen/Qwen3.6-35B-A3B
 DATA   = os.environ["DATA_REPO"]           # lancejames221b/razorstrike-v2-sft
@@ -54,15 +93,14 @@ bnb = BitsAndBytesConfig(
     load_in_4bit=True, bnb_4bit_quant_type="nf4",
     bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
 
-# VLM class first (this is a *ForConditionalGeneration multimodal model);
-# fall back to CausalLM for text-only checkpoints of the same arch.
+# ImageTextToText is the correct class for this *ForConditionalGeneration
+# multimodal arch (confirmed empirically: it resolves cleanly, the only
+# failure was the OOM patched above). No CausalLM fallback - a genuine
+# ImageTextToText failure is virtually always the same root cause, and a
+# blind fallback on the same GPU risked leaking the first attempt's memory.
 _load_kw = dict(quantization_config=bnb, device_map={"": 0},
                 torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
-try:
-    model = AutoModelForImageTextToText.from_pretrained(BASE, **_load_kw)
-except Exception as e:
-    print(f"[load] ImageTextToText failed ({type(e).__name__}); trying CausalLM")
-    model = AutoModelForCausalLM.from_pretrained(BASE, **_load_kw)
+model = AutoModelForImageTextToText.from_pretrained(BASE, **_load_kw)
 model.config.use_cache = False
 model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
