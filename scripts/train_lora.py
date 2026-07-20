@@ -143,8 +143,9 @@ args = TrainingArguments(
     learning_rate=2e-4, lr_scheduler_type="cosine", warmup_ratio=0.03,
     bf16=True, gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
-    max_grad_norm=1.0, logging_steps=5, save_steps=250, save_total_limit=3,
-    eval_strategy="steps", eval_steps=250, optim="paged_adamw_8bit",
+    max_grad_norm=1.0, logging_steps=5,
+    save_steps=int(os.environ.get("SAVE_STEPS", "50")), save_total_limit=3,
+    eval_strategy="steps", eval_steps=int(os.environ.get("SAVE_STEPS", "50")), optim="paged_adamw_8bit",
     report_to="none", dataloader_num_workers=2,
     # Durable checkpointing: push the latest checkpoint to the Hub every
     # save_steps, so a VM reclamation loses at most one save interval, not
