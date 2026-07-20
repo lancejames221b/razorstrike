@@ -1,22 +1,39 @@
-"""Phase 2 — Training script (the core artifact).
+"""Phase 2 - Training script (the core artifact) for RazorStrike v2.
 
-Runs identically on Colab (CLI or backup notebook). Reads env:
-  BASE_REPO, DATA_REPO, OUT_DIR, ADAPTER_REPO, HF_TOKEN.
+RazorStrike v2 = clean Qwen/Qwen3.6-35B-A3B base + this multi-domain QLoRA.
+
+The base is a 35B MULTIMODAL MoE (Qwen3_5MoeForConditionalGeneration): a hybrid
+text stack (full_attention every 4th layer, linear-attention/SSM elsewhere) plus
+a vision tower. We train a TEXT QLoRA only.
+
+Grounded from the real weight-map (Qwen/Qwen3.6-35B-A3B):
+  - full-attention layers: self_attn.{q,k,v,o}_proj
+  - linear-attention layers: linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}
+  - MoE MLP (256 experts): mlp.{gate_proj,up_proj,down_proj}  <- opt-in (TARGET_MLP=1), huge
+  - vision tower uses different leaves (qkv/proj/fc) so text targets never touch it
+  - router (mlp.gate) is NOT adapted
+
+Loads in 4-bit (QLoRA) so the 35B fits a single 40GB A100 (Colab Pro+).
+Reads env: BASE_REPO, DATA_REPO, OUT_DIR, ADAPTER_REPO, HF_TOKEN,
+  MAXLEN(4096), TARGET_MLP(0), LORA_R(32), LORA_ALPHA(64), RESUME.
 """
 
 import os, torch
-from transformers import (AutoModelForCausalLM, AutoTokenizer,
+from transformers import (AutoModelForImageTextToText, AutoModelForCausalLM,
+                          AutoTokenizer, BitsAndBytesConfig,
                           Trainer, TrainingArguments, DataCollatorForSeq2Seq)
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_dataset
 
-BASE   = os.environ["BASE_REPO"]           # lancejames221b/razorstrike-v1-bf16
-DATA   = os.environ["DATA_REPO"]           # lancejames221b/razorstrike-offsec-v1
-OUT    = os.environ.get("OUT_DIR","/content/adapter")
-MAXLEN = int(os.environ.get("MAXLEN","4096"))
+BASE   = os.environ["BASE_REPO"]           # Qwen/Qwen3.6-35B-A3B
+DATA   = os.environ["DATA_REPO"]           # lancejames221b/razorstrike-v2-sft
+OUT    = os.environ.get("OUT_DIR", "/content/adapter")
+MAXLEN = int(os.environ.get("MAXLEN", "4096"))
 
 tok = AutoTokenizer.from_pretrained(BASE)
-if tok.pad_token is None: tok.pad_token = tok.eos_token
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+
 
 def to_features(ex):
     msgs = ex["messages"]
@@ -24,35 +41,63 @@ def to_features(ex):
     full   = tok.apply_chat_template(msgs,       add_generation_prompt=False, tokenize=True)
     if len(full) > MAXLEN or len(prompt) >= len(full):
         return {"input_ids": None, "attention_mask": None, "labels": None}
-    labels = [-100]*len(prompt) + full[len(prompt):]
-    return {"input_ids": full, "attention_mask":[1]*len(full), "labels": labels}
+    labels = [-100] * len(prompt) + full[len(prompt):]
+    return {"input_ids": full, "attention_mask": [1] * len(full), "labels": labels}
+
 
 ds = load_dataset(DATA)
 ds = ds.map(to_features, remove_columns=ds["train"].column_names)
 ds = ds.filter(lambda r: r["input_ids"] is not None)
 
-model = AutoModelForCausalLM.from_pretrained(
-    BASE, dtype=torch.bfloat16, device_map={"":0},
-    attn_implementation="sdpa", low_cpu_mem_usage=True)
+# 4-bit QLoRA load so the 35B base fits a single 40GB A100.
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True, bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
+
+# VLM class first (this is a *ForConditionalGeneration multimodal model);
+# fall back to CausalLM for text-only checkpoints of the same arch.
+_load_kw = dict(quantization_config=bnb, device_map={"": 0},
+                torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+try:
+    model = AutoModelForImageTextToText.from_pretrained(BASE, **_load_kw)
+except Exception as e:
+    print(f"[load] ImageTextToText failed ({type(e).__name__}); trying CausalLM")
+    model = AutoModelForCausalLM.from_pretrained(BASE, **_load_kw)
 model.config.use_cache = False
-model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-model.enable_input_require_grads()
+model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+# Grounded targets: BOTH attention types (full + linear/SSM). Vision leaves
+# (qkv/proj/fc) differ, so these never touch the vision tower.
+targets = ["q_proj", "k_proj", "v_proj", "o_proj",
+           "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"]
+if os.environ.get("TARGET_MLP", "0") == "1":
+    targets += ["gate_proj", "up_proj", "down_proj"]   # 256 experts -> large adapter
 
 lora = LoraConfig(
-    r=32, lora_alpha=64, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
-    target_modules=["q_proj","k_proj","v_proj","o_proj",
-                    "in_proj_qkv","in_proj_z","in_proj_a","in_proj_b","out_proj",
-                    "gate_proj","up_proj","down_proj"])
+    r=int(os.environ.get("LORA_R", "32")),
+    lora_alpha=int(os.environ.get("LORA_ALPHA", "64")),
+    lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
+    target_modules=targets)
 model = get_peft_model(model, lora)
 model.print_trainable_parameters()
+
+# Fail fast: PEFT silently drops non-matching target names. If almost nothing
+# matched, the adapter would "train" for hours and learn nothing.
+_tp = sum(p.numel() for p in model.parameters() if p.requires_grad)
+_tot = sum(p.numel() for p in model.parameters())
+_pct = 100.0 * _tp / max(_tot, 1)
+print(f"[guard] trainable params: {_tp:,} ({_pct:.4f}% of {_tot:,})")
+assert _pct > 0.01, (f"LoRA matched almost nothing ({_pct:.4f}%). target_modules "
+                     f"do not match {BASE}; inspect model.named_modules().")
 
 args = TrainingArguments(
     output_dir=OUT, num_train_epochs=2,
     per_device_train_batch_size=1, gradient_accumulation_steps=16,
     learning_rate=2e-4, lr_scheduler_type="cosine", warmup_ratio=0.03,
-    bf16=True, gradient_checkpointing=True, max_grad_norm=1.0,
-    logging_steps=5, save_steps=250, save_total_limit=3,
-    eval_strategy="steps", eval_steps=250, optim="adamw_torch",
+    bf16=True, gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": False},
+    max_grad_norm=1.0, logging_steps=5, save_steps=250, save_total_limit=3,
+    eval_strategy="steps", eval_steps=250, optim="paged_adamw_8bit",
     report_to="none", dataloader_num_workers=2)
 
 trainer = Trainer(model=model, args=args,
@@ -60,7 +105,8 @@ trainer = Trainer(model=model, args=args,
     data_collator=DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True))
 trainer.train(resume_from_checkpoint=bool(os.environ.get("RESUME")))
 
-model.save_pretrained(OUT); tok.save_pretrained(OUT)
+model.save_pretrained(OUT)
+tok.save_pretrained(OUT)
 if os.environ.get("ADAPTER_REPO"):
     model.push_to_hub(os.environ["ADAPTER_REPO"], private=True)
     tok.push_to_hub(os.environ["ADAPTER_REPO"], private=True)
