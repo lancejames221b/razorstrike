@@ -90,6 +90,12 @@ print(f"[guard] trainable params: {_tp:,} ({_pct:.4f}% of {_tot:,})")
 assert _pct > 0.01, (f"LoRA matched almost nothing ({_pct:.4f}%). target_modules "
                      f"do not match {BASE}; inspect model.named_modules().")
 
+# ADAPTER_REPO is now REQUIRED (not optional): durability depends on pushing
+# checkpoints to the Hub during training, not just at the very end. A VM
+# reclamation mid-run would otherwise wipe /content and lose everything.
+ADAPTER_REPO = os.environ["ADAPTER_REPO"]
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
 args = TrainingArguments(
     output_dir=OUT, num_train_epochs=2,
     per_device_train_batch_size=1, gradient_accumulation_steps=16,
@@ -98,17 +104,35 @@ args = TrainingArguments(
     gradient_checkpointing_kwargs={"use_reentrant": False},
     max_grad_norm=1.0, logging_steps=5, save_steps=250, save_total_limit=3,
     eval_strategy="steps", eval_steps=250, optim="paged_adamw_8bit",
-    report_to="none", dataloader_num_workers=2)
+    report_to="none", dataloader_num_workers=2,
+    # Durable checkpointing: push the latest checkpoint to the Hub every
+    # save_steps, so a VM reclamation loses at most one save interval, not
+    # the whole run. Resumable via `last-checkpoint` in ADAPTER_REPO.
+    push_to_hub=True, hub_model_id=ADAPTER_REPO, hub_token=HF_TOKEN,
+    hub_private_repo=True, hub_strategy="checkpoint")
 
 trainer = Trainer(model=model, args=args,
     train_dataset=ds["train"], eval_dataset=ds["validation"],
     data_collator=DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True))
-trainer.train(resume_from_checkpoint=bool(os.environ.get("RESUME")))
+
+resume_path = None
+if os.environ.get("RESUME"):
+    # Pull the last checkpoint back from the Hub (local OUT may be gone after
+    # a VM churn) before resuming.
+    from huggingface_hub import snapshot_download
+    try:
+        ck_dir = snapshot_download(ADAPTER_REPO, allow_patterns="last-checkpoint/*",
+                                   token=HF_TOKEN, local_dir=OUT)
+        resume_path = os.path.join(OUT, "last-checkpoint")
+        print(f"[resume] pulled checkpoint from hub -> {resume_path}")
+    except Exception as e:
+        print(f"[resume] no hub checkpoint found ({type(e).__name__}: {e}); starting fresh")
+
+trainer.train(resume_from_checkpoint=resume_path)
 
 model.save_pretrained(OUT)
 tok.save_pretrained(OUT)
-if os.environ.get("ADAPTER_REPO"):
-    model.push_to_hub(os.environ["ADAPTER_REPO"], private=True)
-    tok.push_to_hub(os.environ["ADAPTER_REPO"], private=True)
+model.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
+tok.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
 
 print("TRAINING_COMPLETE")
