@@ -88,6 +88,51 @@ def _patch_transformers_bnb_oom():
     return True
 
 
+def _patch_materialize_copy_oom_retry():
+    """Second, more general safety net for the SAME transformers#43032 family.
+
+    The first patch (above) fixes the main per-parameter loop, but empirically
+    a SEPARATE code path (MoE expert weight merging: multiple source tensors -
+    e.g. per-expert gate_proj/up_proj - collected via WeightConverter.add_tensor
+    and materialized later inside materialize_tensors()/mapping.convert()) still
+    OOMs the same way. Rather than hunt every call site that decides a device
+    ahead of a quantize step, patch the single lowest-level primitive that
+    actually performs the GPU copy: catch the OOM there and retry on CPU. The
+    quantizer's convert() step (already verified correct by the first patch)
+    still places the final compressed tensor on the target GPU device.
+    """
+    import transformers.core_model_loading as cml
+    target_fn = cml._materialize_copy
+    src = inspect.getsource(target_fn)
+    anchor = "        tensor = tensor.to(device=device, dtype=dtype)\n"
+    n = src.count(anchor)
+    assert n == 1, (
+        f"[patch] _materialize_copy OOM-retry workaround FAILED: expected "
+        f"exactly 1 anchor match, found {n}. transformers version has "
+        f"drifted from the pinned 5.14.1 this patch was verified against "
+        f"(transformers.__version__: {__import__('transformers').__version__}).")
+    patched = src.replace(
+        anchor,
+        "        try:\n"
+        + anchor.replace("        ", "            ", 1)
+        + "        except torch.OutOfMemoryError:\n"
+        "            if device is None or str(device) == 'cpu':\n"
+        "                raise\n"
+        "            torch.cuda.empty_cache()\n"
+        "            tensor = tensor.to(device='cpu', dtype=dtype)  # patched: OOM retry, transformers#43032\n",
+        1)
+    import textwrap
+    dedented = "from __future__ import annotations\n" + textwrap.dedent(patched)
+    local_ns = {}
+    exec(compile(dedented, cml.__file__, "exec"), cml.__dict__, local_ns)
+    cml._materialize_copy = local_ns["_materialize_copy"]
+    print("[patch] applied transformers#43032 secondary workaround (OOM-catch-retry-on-CPU in _materialize_copy)")
+    return True
+
+
+_patch_materialize_copy_oom_retry()
+
+
 _patch_transformers_bnb_oom()
 
 BASE   = os.environ["BASE_REPO"]           # Qwen/Qwen3.6-35B-A3B
