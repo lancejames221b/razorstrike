@@ -61,6 +61,14 @@ def _load_builders():
     ]
 
 
+# Rebalance: cap the giant families, upsample the two families that define v2
+# (anti-spiral + uncensor) so they get real gradient signal at 2 epochs.
+CAPS = {"decompile": int(os.environ.get("CAP_DECOMPILE", "25000")),
+        "math": int(os.environ.get("CAP_MATH", "22000"))}
+UPSAMPLE = {"loop_recovery": int(os.environ.get("UP_LOOP", "3")),
+            "uncensor": int(os.environ.get("UP_UNCENSOR", "3"))}
+
+
 def build_combined(cap=0, push=False):
     """Build every family, tag family_value, shuffle, split, optionally push."""
     all_rows, counts, failures = [], {}, {}
@@ -68,6 +76,11 @@ def build_combined(cap=0, push=False):
         try:
             ds = fn(cap=cap) if (supports_cap and cap) else fn()
             rows = list(ds["train"])
+            if label in CAPS and len(rows) > CAPS[label]:
+                random.seed(SHUFFLE_SEED)
+                rows = random.sample(rows, CAPS[label])
+            if UPSAMPLE.get(label, 1) > 1:
+                rows = rows * UPSAMPLE[label]
             for r in rows:
                 r.setdefault("family", label)
                 r["family_value"] = FAMILY_VALUES.get(r.get("family", label),

@@ -120,8 +120,8 @@ def build_crypto_id_dataset():
         ]
 
         rows.append({
-            "source": f"{name.lower()}_{label}",
-            "family": name,
+            "source": f"crypto_id/{name.lower()}_{label}",
+            "family": "crypto_id",
             "messages": messages,
         })
 
