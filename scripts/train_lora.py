@@ -145,7 +145,7 @@ args = TrainingArguments(
     gradient_checkpointing_kwargs={"use_reentrant": False},
     max_grad_norm=1.0, logging_steps=5,
     save_steps=int(os.environ.get("SAVE_STEPS", "50")), save_total_limit=3,
-    eval_strategy="steps", eval_steps=int(os.environ.get("SAVE_STEPS", "50")), optim="paged_adamw_8bit",
+    eval_strategy="steps", eval_steps=int(os.environ.get("EVAL_STEPS", "250")), optim="paged_adamw_8bit",
     report_to="none", dataloader_num_workers=2,
     # Durable checkpointing: push the latest checkpoint to the Hub every
     # save_steps, so a VM reclamation loses at most one save interval, not
