@@ -44,15 +44,17 @@ def _patch_transformers_bnb_oom():
     including a fresh VM after a reclaim/RESUME - with no persistent VM state.
     """
     import transformers.core_model_loading as cml
-    src = inspect.getsource(cml)
+    target_fn = cml.convert_and_load_state_dict_in_model
+    src = inspect.getsource(target_fn)
     anchor = "            materialize_device = param_device\n"
     n = src.count(anchor)
     assert n == 1, (
         f"[patch] transformers#43032 workaround FAILED: expected exactly 1 anchor "
-        f"match for 'materialize_device = param_device', found {n}. transformers "
-        f"version has drifted from the pinned 5.14.1 this patch was verified "
-        f"against - loading now would silently reproduce the 35B QLoRA OOM after "
-        f"a long download. Re-verify the fix against the installed version "
+        f"match for 'materialize_device = param_device' inside "
+        f"convert_and_load_state_dict_in_model, found {n}. transformers version "
+        f"has drifted from the pinned 5.14.1 this patch was verified against - "
+        f"loading now would silently reproduce the 35B QLoRA OOM after a long "
+        f"download. Re-verify the fix against the installed version "
         f"(transformers.__version__: {__import__('transformers').__version__}) "
         f"before proceeding.")
     patched = src.replace(
@@ -60,7 +62,21 @@ def _patch_transformers_bnb_oom():
         anchor + "            if mapping.quantization_operation is not None:\n"
                  "                materialize_device = 'cpu'  # patched: avoid pre-quant GPU OOM, transformers#43032\n",
         1)
-    exec(compile(patched, cml.__file__, "exec"), cml.__dict__)
+    # Compile ONLY this one function's source (dedented, since inspect.getsource
+    # returns it indented as a class/module member) and rebind it in the
+    # module's namespace. Crucially this does NOT re-execute the rest of the
+    # file - imports, class definitions, decorators, and any other module-level
+    # side effects run exactly once (via the normal `import transformers`), so
+    # nothing gets double-registered. (An earlier version of this patch
+    # exec()'d the WHOLE module source a second time, which silently
+    # double-registered a weight-conversion mapping and broke MoE checkpoint
+    # loading with an unrelated "many-to-many" ValueError - do not regress to
+    # that approach.)
+    import textwrap
+    dedented = textwrap.dedent(patched)
+    local_ns = {}
+    exec(compile(dedented, cml.__file__, "exec"), cml.__dict__, local_ns)
+    cml.convert_and_load_state_dict_in_model = local_ns["convert_and_load_state_dict_in_model"]
     print("[patch] applied transformers#43032 workaround (quantized params materialize on CPU first)")
     return True
 
