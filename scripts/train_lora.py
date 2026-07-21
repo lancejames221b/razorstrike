@@ -38,8 +38,8 @@ if tok.pad_token is None:
 
 def to_features(ex):
     msgs = ex["messages"]
-    prompt = tok.apply_chat_template(msgs[:-1], add_generation_prompt=True, tokenize=True)
-    full   = tok.apply_chat_template(msgs,       add_generation_prompt=False, tokenize=True)
+    prompt = tok.apply_chat_template(msgs[:-1], add_generation_prompt=True, tokenize=True)["input_ids"]
+    full   = tok.apply_chat_template(msgs,       add_generation_prompt=False, tokenize=True)["input_ids"]
     if len(full) > MAXLEN or len(prompt) >= len(full):
         return {"input_ids": None, "attention_mask": None, "labels": None}
     labels = [-100] * len(prompt) + full[len(prompt):]
