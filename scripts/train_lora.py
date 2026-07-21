@@ -135,7 +135,7 @@ _patch_materialize_copy_oom_retry()
 
 _patch_transformers_bnb_oom()
 
-BASE   = os.environ["BASE_REPO"]           # Qwen/Qwen3.6-35B-A3B
+BASE   = os.environ["BASE_REPO"]           # Qwen/Qwen3.5-27B (dense; pivoted off 35B-A3B MoE, see docstring)
 DATA   = os.environ["DATA_REPO"]           # lancejames221b/razorstrike-v2-sft
 OUT    = os.environ.get("OUT_DIR", "/content/adapter")
 MAXLEN = int(os.environ.get("MAXLEN", "4096"))
@@ -159,7 +159,8 @@ ds = load_dataset(DATA)
 ds = ds.map(to_features, remove_columns=ds["train"].column_names)
 ds = ds.filter(lambda r: r["input_ids"] is not None)
 
-# 4-bit QLoRA load so the 35B base fits a single 40GB A100.
+# 4-bit QLoRA load. Dense model (no MoE expert-merge weight conversion), so
+# none of the MoE-specific transformers#43032 failure modes apply here.
 bnb = BitsAndBytesConfig(
     load_in_4bit=True, bnb_4bit_quant_type="nf4",
     bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
@@ -180,7 +181,7 @@ model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 targets = ["q_proj", "k_proj", "v_proj", "o_proj",
            "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"]
 if os.environ.get("TARGET_MLP", "0") == "1":
-    targets += ["gate_proj", "up_proj", "down_proj"]   # 256 experts -> large adapter
+    targets += ["gate_proj", "up_proj", "down_proj"]   # dense MLP, adds real size but no expert-count blowup
 
 lora = LoraConfig(
     r=int(os.environ.get("LORA_R", "32")),
