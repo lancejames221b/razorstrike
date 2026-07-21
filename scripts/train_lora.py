@@ -29,7 +29,7 @@ from datasets import load_dataset
 BASE   = os.environ.get("BASE_REPO", "Qwen/Qwen3.6-35B-A3B")
 DATA   = os.environ["DATA_REPO"]           # lancejames221b/razorstrike-v2-sft
 OUT    = os.environ.get("OUT_DIR", "/content/adapter")
-MAXLEN = int(os.environ.get("MAXLEN", "4096"))
+MAXLEN = int(os.environ.get("MAXLEN", "3072"))  # 4096 tail (0.2% of rows >4096, 1.1% >3072) OOMs on 96GB G4; verified via row-length sampling
 
 tok = AutoTokenizer.from_pretrained(BASE)
 if tok.pad_token is None:
