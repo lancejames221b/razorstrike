@@ -154,17 +154,22 @@ def get_hub_global_step():
     """Authoritative progress signal: query the Hub checkpoint directly,
     independent of anything happening on the (possibly dead) VM. Retries
     on transient failure; returns None only after all retries are exhausted,
-    which callers treat as a stuck-signal (not a silent skip)."""
+    which callers treat as a stuck-signal (not a silent skip).
+
+    Calls hf_hub_download IN-PROCESS rather than via a spawned `python3`
+    subprocess: under a hub-managed process's minimal environment, a bare
+    `python3` on PATH could resolve to an interpreter without
+    huggingface_hub installed, silently producing empty stdout -> int('')
+    failure on every attempt. Importing directly here removes that
+    ambiguity entirely."""
+    from huggingface_hub import hf_hub_download
+    import json as _json
     for attempt in range(3):
         try:
-            r = subprocess.run(
-                ["python3", "-c",
-                 f"from huggingface_hub import hf_hub_download; import json; "
-                 f"p = hf_hub_download('{ADAPTER_FULL}', 'last-checkpoint/trainer_state.json', token='{HF_TOKEN}'); "
-                 f"print(json.load(open(p)).get('global_step'))"],
-                cwd="/Volumes/Scratch", capture_output=True, text=True, timeout=30
-            )
-            return int(r.stdout.strip())
+            p = hf_hub_download(ADAPTER_FULL, "last-checkpoint/trainer_state.json", token=HF_TOKEN)
+            with open(p) as f:
+                step = _json.load(f).get("global_step")
+            return int(step)
         except Exception as e:
             print(f"[driver] hub global_step read attempt {attempt+1}/3 failed: {e}", flush=True)
             time.sleep(10)
