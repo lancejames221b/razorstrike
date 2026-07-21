@@ -43,14 +43,21 @@ def save_state(state):
 
 
 def get_hf_token(max_attempts=5):
-    # Prefer an explicitly-injected HF_TOKEN env var (set at `hub start` time,
-    # captured from THIS interactive shell) over huggingface_hub's get_token(),
-    # which resolves the cache path from HOME - a hub-managed process may get
-    # a different/minimal HOME and silently fail to find the token file even
-    # though it works fine in an interactive shell.
+    # Priority 1: explicitly-injected HF_TOKEN env var (set at `hub start` time).
+    # Priority 2: a fixed /tmp path written by the launching shell - HOME-independent,
+    #   so it works even if the hub-managed process gets a different/minimal HOME.
+    # Priority 3: huggingface_hub's get_token() file resolution (depends on HOME,
+    #   known to fail silently in a minimal-env hub-managed process - see commit history).
     env_tok = os.environ.get("HF_TOKEN", "").strip()
     if env_tok:
         return env_tok
+    token_file = "/tmp/_rs_hftoken.txt"
+    if os.path.exists(token_file):
+        with open(token_file) as f:
+            file_tok = f.read().strip()
+        if file_tok:
+            print(f"[driver] HF_TOKEN loaded from {token_file}", flush=True)
+            return file_tok
     print("[driver] HF_TOKEN not in env, falling back to huggingface_hub.get_token() file resolution", flush=True)
     for attempt in range(max_attempts):
         r = subprocess.run(
