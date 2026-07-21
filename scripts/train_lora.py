@@ -112,7 +112,7 @@ args = TrainingArguments(
     # save_steps, so a VM reclamation loses at most one save interval, not
     # the whole run. Resumable via `last-checkpoint` in ADAPTER_REPO.
     push_to_hub=True, hub_model_id=ADAPTER_REPO, hub_token=HF_TOKEN,
-    hub_private_repo=True, hub_strategy="checkpoint")
+    hub_private_repo=True, hub_strategy="checkpoint", prediction_loss_only=True)
 
 trainer = Trainer(model=model, args=args,
     train_dataset=ds["train"], eval_dataset=ds["validation"],
