@@ -10,51 +10,90 @@ Loops:
 Crash-loop detection: after every relaunch we check the Hub's global_step. If
 it hasn't advanced (or is unreadable) across MAX_STUCK_CYCLES consecutive
 relaunches, something is structurally broken and we exit for human review
-instead of burning compute forever.
+instead of burning compute forever. Counters persist to a state file so a
+driver-process crash+restart (e.g. from an uncaught subprocess timeout)
+can't silently reset the guard.
 """
 import subprocess
 import time
 import sys
+import json
+import os
 
 SESSION = "rs-g4"
 ADAPTER_FULL = "lancejames221b/razorstrike-v2-offsec-lora"
 MAX_STUCK_CYCLES = 5
+STATE_FILE = "/tmp/rs_autodrive_state.json"
 
-HF_TOKEN = subprocess.run(
-    ["python3", "-c", "from huggingface_hub import get_token; print(get_token())"],
-    cwd="/Volumes/Scratch", capture_output=True, text=True
-).stdout.strip()
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"stuck_cycles": 0, "consecutive_provision_failures": 0, "last_known_step": None}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"[driver] WARNING: could not persist state: {e}", flush=True)
+
+
+def get_hf_token(max_attempts=5):
+    for attempt in range(max_attempts):
+        r = subprocess.run(
+            ["python3", "-c", "from huggingface_hub import get_token; print(get_token() or '')"],
+            cwd="/Volumes/Scratch", capture_output=True, text=True
+        )
+        tok = r.stdout.strip()
+        if tok:
+            return tok
+        print(f"[driver] HF_TOKEN read attempt {attempt+1}/{max_attempts} came back empty (stderr: {r.stderr[-200:]}), retrying in 5s", flush=True)
+        time.sleep(5)
+    print("[driver] FATAL: could not obtain a non-empty HF_TOKEN after retries. Exiting for human review - "
+          "proceeding would launch training with no auth against private repos.", flush=True)
+    sys.exit(3)
+
+
+HF_TOKEN = get_hf_token()
+print(f"[driver] HF_TOKEN acquired (len={len(HF_TOKEN)})", flush=True)
 
 LAUNCH_PY = f'''
 import subprocess, os, time
 r0 = subprocess.run("HF_TOKEN='{HF_TOKEN}' python3 -c \\"from huggingface_hub import login; login('{HF_TOKEN}'); print('HF_LOGIN_OK')\\"", shell=True, capture_output=True, text=True)
 print(r0.stdout, r0.stderr[-300:])
-r1 = subprocess.run("test -d /content/razorstrike && cd /content/razorstrike && git pull --ff-only 2>&1 || (rm -rf /content/razorstrike && git clone --depth 1 https://github.com/lancejames221b/razorstrike.git /content/razorstrike 2>&1)", shell=True, capture_output=True, text=True)
-print("SYNC:", r1.stdout[-300:])
-r2 = subprocess.run("cd /content/razorstrike && python3 scripts/vm_setup.py 2>&1 | tail -25", shell=True, capture_output=True, text=True, timeout=300)
-print("SETUP:", r2.stdout)
-subprocess.run("pkill -f train_lora 2>/dev/null", shell=True)
-time.sleep(2)
-env = os.environ.copy()
-env.update({{
-    "BASE_REPO": "Qwen/Qwen3.6-35B-A3B",
-    "DATA_REPO": "lancejames221b/razorstrike-v2-sft",
-    "ADAPTER_REPO": "{ADAPTER_FULL}",
-    "OUT_DIR": "/content/adapter",
-    "MAXLEN": "3072",
-    "TARGET_MLP": "0",
-    "SAVE_STEPS": "20",
-    "EVAL_STEPS": "100",
-    "RESUME": "1",
-    "HF_TOKEN": "{HF_TOKEN}",
-    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-}})
-cmd = "cd /content/razorstrike && nohup python3 -m scripts.train_lora > /content/train.log 2>&1 &"
-subprocess.Popen(cmd, shell=True, env=env)
-time.sleep(3)
-r3 = subprocess.run("pgrep -af train_lora || echo NOT_RUNNING", shell=True, capture_output=True, text=True)
-print("PROC:", r3.stdout.strip())
-print("TRAIN_LAUNCHED")
+if "HF_LOGIN_OK" not in r0.stdout:
+    print("HF_LOGIN_FAILED - aborting launch")
+else:
+    r1 = subprocess.run("test -d /content/razorstrike && cd /content/razorstrike && git pull --ff-only 2>&1 || (rm -rf /content/razorstrike && git clone --depth 1 https://github.com/lancejames221b/razorstrike.git /content/razorstrike 2>&1)", shell=True, capture_output=True, text=True)
+    print("SYNC:", r1.stdout[-300:])
+    r2 = subprocess.run("cd /content/razorstrike && python3 scripts/vm_setup.py 2>&1 | tail -25", shell=True, capture_output=True, text=True, timeout=300)
+    print("SETUP:", r2.stdout)
+    subprocess.run("pkill -f train_lora 2>/dev/null", shell=True)
+    time.sleep(2)
+    env = os.environ.copy()
+    env.update({{
+        "BASE_REPO": "Qwen/Qwen3.6-35B-A3B",
+        "DATA_REPO": "lancejames221b/razorstrike-v2-sft",
+        "ADAPTER_REPO": "{ADAPTER_FULL}",
+        "OUT_DIR": "/content/adapter",
+        "MAXLEN": "3072",
+        "TARGET_MLP": "0",
+        "SAVE_STEPS": "20",
+        "EVAL_STEPS": "100",
+        "RESUME": "1",
+        "HF_TOKEN": "{HF_TOKEN}",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    }})
+    cmd = "cd /content/razorstrike && nohup python3 -m scripts.train_lora > /content/train.log 2>&1 &"
+    subprocess.Popen(cmd, shell=True, env=env)
+    time.sleep(3)
+    r3 = subprocess.run("pgrep -af train_lora || echo NOT_RUNNING", shell=True, capture_output=True, text=True)
+    print("PROC:", r3.stdout.strip())
+    print("TRAIN_LAUNCHED")
 '''
 
 POLL_PY = '''
@@ -68,8 +107,21 @@ print(r3.stdout.strip())
 '''
 
 
+class _TimedOut:
+    """Sentinel returned when a subprocess call hangs past its timeout, so
+    callers can treat it as a normal (failed) result instead of an uncaught
+    exception that would kill the whole driver process."""
+    stdout = ""
+    stderr = "TIMED_OUT"
+    returncode = -1
+
+
 def run(cmd, timeout=120):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"[driver] WARNING: command timed out after {timeout}s: {cmd[:100]}", flush=True)
+        return _TimedOut()
 
 
 def write(path, content):
@@ -118,6 +170,9 @@ def relaunch_on_live_session():
     write("/tmp/_rs_launch.py", LAUNCH_PY)
     r = run(f"colab exec -s {SESSION} -f /tmp/_rs_launch.py --timeout 300", timeout=330)
     print("[driver] launch output:", r.stdout[-1500:], flush=True)
+    if "HF_LOGIN_FAILED" in r.stdout:
+        print("[driver] HF login failed on the VM itself - treating as launch failure", flush=True)
+        return False
     return "TRAIN_LAUNCHED" in r.stdout
 
 
@@ -127,32 +182,34 @@ def poll_once():
     return r.stdout
 
 
-def check_progress_or_die(last_known_step, stuck_cycles):
-    """Returns (new_last_known_step, new_stuck_cycles); exits process if stuck too long.
+def check_progress_or_die(state):
+    """Mutates and persists state; exits process if stuck too long.
     A persistently-unreadable step counts as non-progress too, so an auth/network
     failure can't silently disable the crash-loop guard."""
     new_step = get_hub_global_step()
+    last_known_step = state["last_known_step"]
     print(f"[driver] post-relaunch hub global_step={new_step} (was {last_known_step})", flush=True)
     made_progress = (new_step is not None and last_known_step is not None and new_step > last_known_step)
     if made_progress:
-        stuck_cycles = 0
+        state["stuck_cycles"] = 0
     else:
-        stuck_cycles += 1
-        print(f"[driver] no confirmed forward progress ({stuck_cycles}/{MAX_STUCK_CYCLES})", flush=True)
-        if stuck_cycles >= MAX_STUCK_CYCLES:
+        state["stuck_cycles"] += 1
+        print(f"[driver] no confirmed forward progress ({state['stuck_cycles']}/{MAX_STUCK_CYCLES})", flush=True)
+        if state["stuck_cycles"] >= MAX_STUCK_CYCLES:
             print("[driver] STUCK: no step progress across multiple relaunches, exiting for human review", flush=True)
+            save_state(state)
             sys.exit(2)
     if new_step is not None:
-        last_known_step = new_step
-    return last_known_step, stuck_cycles
+        state["last_known_step"] = new_step
+    save_state(state)
 
 
 def main():
     print("[driver] starting autodrive loop", flush=True)
-    consecutive_provision_failures = 0
-    last_known_step = get_hub_global_step()
-    stuck_cycles = 0
-    print(f"[driver] initial hub global_step={last_known_step}", flush=True)
+    state = load_state()
+    if state["last_known_step"] is None:
+        state["last_known_step"] = get_hub_global_step()
+    print(f"[driver] resumed state: {state}", flush=True)
 
     while True:
         alive, status = session_alive()
@@ -161,16 +218,18 @@ def main():
             print(f"[driver] session dead/missing ({status.strip()}), reprovisioning", flush=True)
             ok = reprovision_and_launch()
             if not ok:
-                consecutive_provision_failures += 1
-                print(f"[driver] provision/launch failed ({consecutive_provision_failures} in a row), backing off 60s", flush=True)
+                state["consecutive_provision_failures"] += 1
+                save_state(state)
+                print(f"[driver] provision/launch failed ({state['consecutive_provision_failures']} in a row), backing off 60s", flush=True)
                 time.sleep(60)
-                if consecutive_provision_failures >= 10:
+                if state["consecutive_provision_failures"] >= 10:
                     print("[driver] too many consecutive provision failures, exiting for human review", flush=True)
                     sys.exit(1)
                 continue
-            consecutive_provision_failures = 0
+            state["consecutive_provision_failures"] = 0
+            save_state(state)
             time.sleep(90)
-            last_known_step, stuck_cycles = check_progress_or_die(last_known_step, stuck_cycles)
+            check_progress_or_die(state)
             continue
 
         out = poll_once()
@@ -189,7 +248,7 @@ def main():
                 time.sleep(15)
                 continue
             time.sleep(90)
-            last_known_step, stuck_cycles = check_progress_or_die(last_known_step, stuck_cycles)
+            check_progress_or_die(state)
             continue
 
         time.sleep(90)
