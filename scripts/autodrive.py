@@ -9,10 +9,17 @@ Loops:
 
 Crash-loop detection: after every relaunch we check the Hub's global_step. If
 it hasn't advanced (or is unreadable) across MAX_STUCK_CYCLES consecutive
-relaunches, something is structurally broken and we exit for human review
+relaunches, something is structurally broken and we halt for human review
 instead of burning compute forever. Counters persist to a state file so a
-driver-process crash+restart (e.g. from an uncaught subprocess timeout)
-can't silently reset the guard.
+driver-process crash+restart can't silently reset the guard.
+
+IMPORTANT: this process is normally launched under `hub start` with
+`restart: on-failure`, which means a plain `sys.exit(nonzero)` gets silently
+RELAUNCHED, not halted - defeating any "exit for human review" intent. All
+terminal-failure paths therefore go through `halt()`, which writes a sentinel
+file checked at the top of every `main()` invocation (so even a hub-forced
+restart just re-halts instead of doing real work) and fires an actual macOS
+notification so a silent multi-day wedge surfaces to the user.
 """
 import subprocess
 import time
@@ -24,6 +31,31 @@ SESSION = "rs-g4"
 ADAPTER_FULL = "lancejames221b/razorstrike-v2-offsec-lora"
 MAX_STUCK_CYCLES = 5
 STATE_FILE = "/tmp/rs_autodrive_state.json"
+HALT_FILE = "/tmp/rs_autodrive_HALT.txt"
+
+
+def notify(title, message):
+    """Fire an actual macOS notification (banner + sound)."""
+    try:
+        script = f'display notification "{message}" with title "{title}" sound name "Basso"'
+        subprocess.run(["osascript", "-e", script], timeout=10)
+    except Exception as e:
+        print(f"[driver] WARNING: notify() failed: {e}", flush=True)
+
+
+def halt(reason):
+    """Terminal failure: write a sentinel file, notify, and exit. If hub
+    restarts us anyway (restart: on-failure), main() sees the sentinel
+    immediately on the next startup and re-halts instead of silently
+    burning compute / provision cycles."""
+    print(f"[driver] HALTING: {reason}", flush=True)
+    try:
+        with open(HALT_FILE, "w") as f:
+            f.write(reason)
+    except Exception as e:
+        print(f"[driver] WARNING: could not write halt sentinel: {e}", flush=True)
+    notify("RazorStrike training driver HALTED", reason[:200])
+    sys.exit(1)
 
 
 def load_state():
@@ -58,7 +90,7 @@ def get_hf_token(max_attempts=5):
         if file_tok:
             print(f"[driver] HF_TOKEN loaded from {token_file}", flush=True)
             return file_tok
-    print("[driver] HF_TOKEN not in env, falling back to huggingface_hub.get_token() file resolution", flush=True)
+    print("[driver] HF_TOKEN not in env or token file, falling back to huggingface_hub.get_token() file resolution", flush=True)
     for attempt in range(max_attempts):
         r = subprocess.run(
             ["python3", "-c", "from huggingface_hub import get_token; print(get_token() or '')"],
@@ -69,10 +101,16 @@ def get_hf_token(max_attempts=5):
             return tok
         print(f"[driver] HF_TOKEN read attempt {attempt+1}/{max_attempts} came back empty (stderr: {r.stderr[-200:]}), retrying in 5s", flush=True)
         time.sleep(5)
-    print("[driver] FATAL: could not obtain a non-empty HF_TOKEN (env var absent AND get_token() file resolution failed after retries). "
-          "Exiting for human review - proceeding would launch training with no auth against private repos.", flush=True)
-    sys.exit(3)
+    halt("could not obtain a non-empty HF_TOKEN (env var, token file, AND get_token() resolution all failed after retries) - "
+         "proceeding would launch training with no auth against private repos.")
 
+
+if os.path.exists(HALT_FILE):
+    with open(HALT_FILE) as f:
+        _halt_reason = f.read()
+    print(f"[driver] HALT sentinel present, refusing to run: {_halt_reason}", flush=True)
+    notify("RazorStrike training driver still HALTED", _halt_reason[:200])
+    sys.exit(1)
 
 HF_TOKEN = get_hf_token()
 print(f"[driver] HF_TOKEN acquired (len={len(HF_TOKEN)})", flush=True)
@@ -204,7 +242,7 @@ def poll_once():
 
 
 def check_progress_or_die(state):
-    """Mutates and persists state; exits process if stuck too long.
+    """Mutates and persists state; halts for human review if stuck too long.
     A persistently-unreadable step counts as non-progress too, so an auth/network
     failure can't silently disable the crash-loop guard."""
     new_step = get_hub_global_step()
@@ -217,9 +255,8 @@ def check_progress_or_die(state):
         state["stuck_cycles"] += 1
         print(f"[driver] no confirmed forward progress ({state['stuck_cycles']}/{MAX_STUCK_CYCLES})", flush=True)
         if state["stuck_cycles"] >= MAX_STUCK_CYCLES:
-            print("[driver] STUCK: no step progress across multiple relaunches, exiting for human review", flush=True)
             save_state(state)
-            sys.exit(2)
+            halt(f"no step progress across {MAX_STUCK_CYCLES} consecutive relaunches (stuck at step {last_known_step})")
     if new_step is not None:
         state["last_known_step"] = new_step
     save_state(state)
@@ -244,8 +281,7 @@ def main():
                 print(f"[driver] provision/launch failed ({state['consecutive_provision_failures']} in a row), backing off 60s", flush=True)
                 time.sleep(60)
                 if state["consecutive_provision_failures"] >= 10:
-                    print("[driver] too many consecutive provision failures, exiting for human review", flush=True)
-                    sys.exit(1)
+                    halt(f"too many consecutive provision failures ({state['consecutive_provision_failures']})")
                 continue
             state["consecutive_provision_failures"] = 0
             save_state(state)
@@ -258,6 +294,7 @@ def main():
 
         if "TRAINING_COMPLETE" in out:
             print("[driver] TRAINING COMPLETE - exiting driver loop", flush=True)
+            notify("RazorStrike training COMPLETE", f"Reached target step count. Adapter pushed to {ADAPTER_FULL}.")
             sys.exit(0)
 
         if "OutOfMemoryError" in out or "Traceback" in out or "PROCESS_EXITED" in out:
