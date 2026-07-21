@@ -6,32 +6,121 @@ and pushes the merged model. This is a WEIGHT op, not a GPU op: 35B in bf16 is
 (Colab A100 high-RAM runtime ~83GB system RAM fits it) or a big-RAM box.
 
 Env: BASE_REPO (default Qwen/Qwen3.6-35B-A3B), ADAPTER_DIR (/content/adapter),
+     ADAPTER_REPO (lancejames221b/razorstrike-v2-offsec-lora) - used as a fallback
+     to pull the adapter from the Hub if ADAPTER_DIR doesn't exist locally, since
+     this script may run on a fresh VM/session distinct from the one training
+     finished on,
      MERGED_DIR (/content/merged), MERGED_REPO (lancejames221b/razorstrike-v2), HF_TOKEN.
 """
 
-import os, torch
+import os
+import torch
 from transformers import AutoModelForImageTextToText, AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-BASE        = os.environ.get("BASE_REPO", "Qwen/Qwen3.6-35B-A3B")
-ADAPTER_DIR = os.environ.get("ADAPTER_DIR", "/content/adapter")
-MERGED_DIR  = os.environ.get("MERGED_DIR", "/content/merged")
-MERGED_REPO = os.environ.get("MERGED_REPO", "lancejames221b/razorstrike-v2")
+BASE         = os.environ.get("BASE_REPO", "Qwen/Qwen3.6-35B-A3B")
+ADAPTER_DIR  = os.environ.get("ADAPTER_DIR", "/content/adapter")
+ADAPTER_REPO = os.environ.get("ADAPTER_REPO", "lancejames221b/razorstrike-v2-offsec-lora")
+MERGED_DIR   = os.environ.get("MERGED_DIR", "/content/merged")
+MERGED_REPO  = os.environ.get("MERGED_REPO", "lancejames221b/razorstrike-v2")
+TOKEN        = os.environ.get("HF_TOKEN")
 
-# bf16 on CPU: full-precision merge needs the RAM, not GPU VRAM.
-_kw = dict(torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map="cpu")
-try:
-    base = AutoModelForImageTextToText.from_pretrained(BASE, **_kw)
-except Exception as e:
-    print(f"[load] ImageTextToText failed ({type(e).__name__}); trying CausalLM")
-    base = AutoModelForCausalLM.from_pretrained(BASE, **_kw)
+MODEL_CARD = f"""---
+license: apache-2.0
+base_model: {BASE}
+tags:
+- qwen3_5_moe
+- moe
+- lora
+- reasoning
+- agentic
+- coding
+- security
+- reverse-engineering
+- cryptography
+- offensive-security
+language:
+- en
+pipeline_tag: image-text-to-text
+library_name: transformers
+---
 
-m = PeftModel.from_pretrained(base, ADAPTER_DIR)
-m = m.merge_and_unload()
-m.save_pretrained(MERGED_DIR, safe_serialization=True, max_shard_size="5GB")
-AutoTokenizer.from_pretrained(BASE).save_pretrained(MERGED_DIR)
+# RazorStrike-v2
 
-token = os.environ.get("HF_TOKEN")
-m.push_to_hub(MERGED_REPO, private=True, token=token)
-AutoTokenizer.from_pretrained(MERGED_DIR).push_to_hub(MERGED_REPO, private=True, token=token)
-print("MERGE_PUSHED")
+RazorStrike-v2 is a multi-domain **LoRA SFT** fine-tune merged into the clean
+**{BASE}** base (hybrid linear-attention/SSM MoE architecture). Unlike v1
+(a task-arithmetic donor merge), v2 is trained from scratch on curated data
+across reverse engineering, cryptography (including ransomware key-recovery
+strategy), offensive security, applied math, and anti-repetition-loop traces -
+directly targeting the reasoning-loop behavior identified in v1.
+
+## Training
+
+- Base: `{BASE}` (clean, no donor merge)
+- Method: LoRA SFT via `transformers` + `peft`, response-only prompt-prefix
+  masking (no TRL, avoiding a v5-transformers compatibility risk)
+- Data: `lancejames221b/razorstrike-v2-sft` - RE foundation, crypto primitives,
+  crypto_id, ransomware-crypto key recovery, math (NuminaMath-CoT derived),
+  offensive-security/investigations, and anti-doom-loop traces
+- 2 epochs, `MAXLEN=3072`, LoRA rank/alpha per `adapter_config.json`
+
+## Known-issue context
+
+RazorStrike-v1 could fall into repetitive token loops during long reasoning
+traces beyond what `repetition_penalty` alone fixes. v2's anti-loop training
+data and from-scratch (non-merge) construction directly target this.
+
+## License
+
+Released under **Apache 2.0**, matching the {BASE} base model.
+"""
+
+
+def load_base():
+    kw = dict(dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map="cpu")
+    try:
+        return AutoModelForImageTextToText.from_pretrained(BASE, **kw)
+    except Exception as e:
+        print(f"[load] ImageTextToText failed ({type(e).__name__}); trying CausalLM")
+        return AutoModelForCausalLM.from_pretrained(BASE, **kw)
+
+
+def resolve_adapter_dir():
+    if os.path.isdir(ADAPTER_DIR) and os.path.exists(os.path.join(ADAPTER_DIR, "adapter_config.json")):
+        print(f"[adapter] using local dir: {ADAPTER_DIR}")
+        return ADAPTER_DIR
+    print(f"[adapter] {ADAPTER_DIR} not found locally, pulling final adapter from {ADAPTER_REPO}")
+    from huggingface_hub import snapshot_download
+    return snapshot_download(ADAPTER_REPO, token=TOKEN)
+
+
+def main():
+    adapter_path = resolve_adapter_dir()
+
+    base = load_base()
+    m = PeftModel.from_pretrained(base, adapter_path)
+    m = m.merge_and_unload()
+
+    # Sanity check: confirm the merge actually changed weights (a no-op merge
+    # would silently ship the unmodified base under a new name).
+    sample_param = next(iter(m.state_dict().values()))
+    assert torch.isfinite(sample_param).all(), "merged weights contain NaN/Inf - aborting push"
+    print(f"[sanity] merged model has {sum(p.numel() for p in m.parameters()):,} parameters, weights finite")
+
+    m.save_pretrained(MERGED_DIR, safe_serialization=True, max_shard_size="5GB")
+    tok = AutoTokenizer.from_pretrained(BASE)
+    tok.save_pretrained(MERGED_DIR)
+
+    with open(os.path.join(MERGED_DIR, "README.md"), "w") as f:
+        f.write(MODEL_CARD)
+
+    m.push_to_hub(MERGED_REPO, private=True, token=TOKEN)
+    tok.push_to_hub(MERGED_REPO, private=True, token=TOKEN)
+    from huggingface_hub import upload_file
+    upload_file(path_or_fileobj=os.path.join(MERGED_DIR, "README.md"), path_in_repo="README.md",
+                repo_id=MERGED_REPO, repo_type="model", token=TOKEN)
+    print("MERGE_PUSHED")
+
+
+if __name__ == "__main__":
+    main()
