@@ -8,18 +8,16 @@ Loops:
   - session alive and training running -> poll for errors/completion
 
 Crash-loop detection: after every relaunch we check the Hub's global_step. If
-it hasn't advanced across MAX_STUCK_CYCLES consecutive relaunches, something
-is structurally broken (bad dep, dataset issue, etc) and we exit for human
-review instead of burning compute forever.
+it hasn't advanced (or is unreadable) across MAX_STUCK_CYCLES consecutive
+relaunches, something is structurally broken and we exit for human review
+instead of burning compute forever.
 """
 import subprocess
 import time
 import sys
-import json
 
 SESSION = "rs-g4"
-ADAPTER_REPO = "razorstrike-v2-offsec-lora"
-ADAPTER_FULL = f"lancejames221b/{ADAPTER_REPO}"
+ADAPTER_FULL = "lancejames221b/razorstrike-v2-offsec-lora"
 MAX_STUCK_CYCLES = 5
 
 HF_TOKEN = subprocess.run(
@@ -86,19 +84,24 @@ def session_alive():
 
 def get_hub_global_step():
     """Authoritative progress signal: query the Hub checkpoint directly,
-    independent of anything happening on the (possibly dead) VM."""
-    try:
-        r = subprocess.run(
-            ["python3", "-c",
-             f"from huggingface_hub import hf_hub_download; import json; "
-             f"p = hf_hub_download('{ADAPTER_FULL}', 'last-checkpoint/trainer_state.json'); "
-             f"print(json.load(open(p)).get('global_step'))"],
-            cwd="/Volumes/Scratch", capture_output=True, text=True, timeout=30
-        )
-        return int(r.stdout.strip())
-    except Exception as e:
-        print(f"[driver] could not read hub global_step: {e}", flush=True)
-        return None
+    independent of anything happening on the (possibly dead) VM. Retries
+    on transient failure; returns None only after all retries are exhausted,
+    which callers treat as a stuck-signal (not a silent skip)."""
+    for attempt in range(3):
+        try:
+            r = subprocess.run(
+                ["python3", "-c",
+                 f"from huggingface_hub import hf_hub_download; import json; "
+                 f"p = hf_hub_download('{ADAPTER_FULL}', 'last-checkpoint/trainer_state.json'); "
+                 f"print(json.load(open(p)).get('global_step'))"],
+                cwd="/Volumes/Scratch", capture_output=True, text=True, timeout=30
+            )
+            return int(r.stdout.strip())
+        except Exception as e:
+            print(f"[driver] hub global_step read attempt {attempt+1}/3 failed: {e}", flush=True)
+            time.sleep(10)
+    print("[driver] hub global_step unreadable after 3 attempts", flush=True)
+    return None
 
 
 def reprovision_and_launch():
@@ -124,6 +127,26 @@ def poll_once():
     return r.stdout
 
 
+def check_progress_or_die(last_known_step, stuck_cycles):
+    """Returns (new_last_known_step, new_stuck_cycles); exits process if stuck too long.
+    A persistently-unreadable step counts as non-progress too, so an auth/network
+    failure can't silently disable the crash-loop guard."""
+    new_step = get_hub_global_step()
+    print(f"[driver] post-relaunch hub global_step={new_step} (was {last_known_step})", flush=True)
+    made_progress = (new_step is not None and last_known_step is not None and new_step > last_known_step)
+    if made_progress:
+        stuck_cycles = 0
+    else:
+        stuck_cycles += 1
+        print(f"[driver] no confirmed forward progress ({stuck_cycles}/{MAX_STUCK_CYCLES})", flush=True)
+        if stuck_cycles >= MAX_STUCK_CYCLES:
+            print("[driver] STUCK: no step progress across multiple relaunches, exiting for human review", flush=True)
+            sys.exit(2)
+    if new_step is not None:
+        last_known_step = new_step
+    return last_known_step, stuck_cycles
+
+
 def main():
     print("[driver] starting autodrive loop", flush=True)
     consecutive_provision_failures = 0
@@ -147,20 +170,7 @@ def main():
                 continue
             consecutive_provision_failures = 0
             time.sleep(90)
-
-            # crash-loop detection: did we actually make forward progress?
-            new_step = get_hub_global_step()
-            print(f"[driver] post-relaunch hub global_step={new_step} (was {last_known_step})", flush=True)
-            if new_step is not None and last_known_step is not None and new_step <= last_known_step:
-                stuck_cycles += 1
-                print(f"[driver] no forward progress across relaunch ({stuck_cycles}/{MAX_STUCK_CYCLES})", flush=True)
-                if stuck_cycles >= MAX_STUCK_CYCLES:
-                    print("[driver] STUCK: no step progress across multiple relaunches, exiting for human review", flush=True)
-                    sys.exit(2)
-            else:
-                stuck_cycles = 0
-            if new_step is not None:
-                last_known_step = new_step
+            last_known_step, stuck_cycles = check_progress_or_die(last_known_step, stuck_cycles)
             continue
 
         out = poll_once()
@@ -179,19 +189,7 @@ def main():
                 time.sleep(15)
                 continue
             time.sleep(90)
-
-            new_step = get_hub_global_step()
-            print(f"[driver] post-relaunch hub global_step={new_step} (was {last_known_step})", flush=True)
-            if new_step is not None and last_known_step is not None and new_step <= last_known_step:
-                stuck_cycles += 1
-                print(f"[driver] no forward progress across relaunch ({stuck_cycles}/{MAX_STUCK_CYCLES})", flush=True)
-                if stuck_cycles >= MAX_STUCK_CYCLES:
-                    print("[driver] STUCK: no step progress across multiple relaunches, exiting for human review", flush=True)
-                    sys.exit(2)
-            else:
-                stuck_cycles = 0
-            if new_step is not None:
-                last_known_step = new_step
+            last_known_step, stuck_cycles = check_progress_or_die(last_known_step, stuck_cycles)
             continue
 
         time.sleep(90)
