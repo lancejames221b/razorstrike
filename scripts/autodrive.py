@@ -43,6 +43,15 @@ def save_state(state):
 
 
 def get_hf_token(max_attempts=5):
+    # Prefer an explicitly-injected HF_TOKEN env var (set at `hub start` time,
+    # captured from THIS interactive shell) over huggingface_hub's get_token(),
+    # which resolves the cache path from HOME - a hub-managed process may get
+    # a different/minimal HOME and silently fail to find the token file even
+    # though it works fine in an interactive shell.
+    env_tok = os.environ.get("HF_TOKEN", "").strip()
+    if env_tok:
+        return env_tok
+    print("[driver] HF_TOKEN not in env, falling back to huggingface_hub.get_token() file resolution", flush=True)
     for attempt in range(max_attempts):
         r = subprocess.run(
             ["python3", "-c", "from huggingface_hub import get_token; print(get_token() or '')"],
@@ -53,8 +62,8 @@ def get_hf_token(max_attempts=5):
             return tok
         print(f"[driver] HF_TOKEN read attempt {attempt+1}/{max_attempts} came back empty (stderr: {r.stderr[-200:]}), retrying in 5s", flush=True)
         time.sleep(5)
-    print("[driver] FATAL: could not obtain a non-empty HF_TOKEN after retries. Exiting for human review - "
-          "proceeding would launch training with no auth against private repos.", flush=True)
+    print("[driver] FATAL: could not obtain a non-empty HF_TOKEN (env var absent AND get_token() file resolution failed after retries). "
+          "Exiting for human review - proceeding would launch training with no auth against private repos.", flush=True)
     sys.exit(3)
 
 
@@ -144,7 +153,7 @@ def get_hub_global_step():
             r = subprocess.run(
                 ["python3", "-c",
                  f"from huggingface_hub import hf_hub_download; import json; "
-                 f"p = hf_hub_download('{ADAPTER_FULL}', 'last-checkpoint/trainer_state.json'); "
+                 f"p = hf_hub_download('{ADAPTER_FULL}', 'last-checkpoint/trainer_state.json', token='{HF_TOKEN}'); "
                  f"print(json.load(open(p)).get('global_step'))"],
                 cwd="/Volumes/Scratch", capture_output=True, text=True, timeout=30
             )
