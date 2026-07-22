@@ -35,9 +35,14 @@ HALT_FILE = "/Volumes/Scratch/razorstrike-repo/.driver_state/HALT.txt"
 
 
 def notify(title, message):
-    """Notifications disabled - restart-loop churn was firing repeated
-    alerts/sounds. Log only."""
-    print(f"[driver] NOTIFY (suppressed): {title}: {message}", flush=True)
+    """Soundless macOS banner - sound was disabled after the alert-storm
+    incident, but a genuine halt should still surface visually rather than
+    go completely silent until morning."""
+    try:
+        script = f'display notification "{message}" with title "{title}"'
+        subprocess.run(["osascript", "-e", script], timeout=10)
+    except Exception as e:
+        print(f"[driver] WARNING: notify() failed: {e}", flush=True)
 
 
 def halt(reason):
