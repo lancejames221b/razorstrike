@@ -261,11 +261,14 @@ def check_progress_or_die(state):
 
     Prefers the LOCAL training-log step (ground truth, read directly off the
     live VM) over the Hub checkpoint step, since the Hub push is async and can
-    lag well behind actual progress - especially right after a relaunch, when
-    preprocessing + model load alone can take several minutes before the first
-    step even runs. Only treats it as stuck when local is unreachable too
-    (session actually dead) AND Hub shows no movement - that combination can't
-    be explained by push lag."""
+    lag well behind actual progress (confirmed: 40-step lag observed). But the
+    only thing that resets stuck_cycles is an ACTUAL step advance past
+    last_known_step - local-reachable-but-stagnant, local-unreachable, and
+    local-unknown all count identically as non-progress toward the same
+    bounded MAX_STUCK_CYCLES threshold. The 480s wait before this check
+    already covers legitimate preprocess+load+resume warm-up time, so a
+    stagnant read at that point is a real signal, not noise - no unbounded
+    grace period that could mask a genuine crash-loop-with-VM-alive."""
     local_step = get_local_step()
     hub_step = get_hub_global_step()
     last_known_step = state["last_known_step"]
@@ -276,18 +279,13 @@ def check_progress_or_die(state):
 
     if made_progress:
         state["stuck_cycles"] = 0
-    elif local_step is not None:
-        # Local is reachable and shows no advance past last_known - genuinely
-        # not stuck-by-lag, but also not yet informative this soon after a
-        # relaunch (could still be mid-preprocess). Don't count this as a
-        # stuck cycle; only Hub-only stagnation (local unreachable) counts.
-        print("[driver] local reachable but not yet past last known step (still warming up) - not counting as stuck", flush=True)
     else:
         state["stuck_cycles"] += 1
-        print(f"[driver] local unreachable AND no confirmed forward progress ({state['stuck_cycles']}/{MAX_STUCK_CYCLES})", flush=True)
+        print(f"[driver] no confirmed forward progress ({state['stuck_cycles']}/{MAX_STUCK_CYCLES})", flush=True)
         if state["stuck_cycles"] >= MAX_STUCK_CYCLES:
             save_state(state)
-            halt(f"no step progress across {MAX_STUCK_CYCLES} consecutive relaunches with local unreachable (stuck at step {last_known_step})")
+            halt(f"no step progress across {MAX_STUCK_CYCLES} consecutive checks (stuck at step {last_known_step}, "
+                 f"last read local={local_step} hub={hub_step})")
     if best_step is not None:
         state["last_known_step"] = best_step
     save_state(state)
