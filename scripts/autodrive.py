@@ -28,7 +28,7 @@ import json
 import os
 
 SESSION = "rs-g4"
-ADAPTER_FULL = "lancejames221b/razorstrike-v2-offsec-lora"
+ADAPTER_FULL = "lancejames221b/HAWQ-SEC-re-validation-lora"
 MAX_STUCK_CYCLES = 5
 STATE_FILE = "/Volumes/Scratch/razorstrike-repo/.driver_state/state.json"
 HALT_FILE = "/Volumes/Scratch/razorstrike-repo/.driver_state/HALT.txt"
@@ -132,8 +132,8 @@ else:
     time.sleep(2)
     env = os.environ.copy()
     env.update({{
-        "BASE_REPO": "Qwen/Qwen3.6-35B-A3B",
-        "DATA_REPO": "lancejames221b/razorstrike-v2-sft",
+        "BASE_REPO": "lancejames221b/HAWQ",
+        "DATA_REPO": "lancejames221b/HAWQ-SEC-re-validation",
         "ADAPTER_REPO": "{ADAPTER_FULL}",
         "OUT_DIR": "/content/adapter",
         "MAXLEN": "3072",
@@ -141,6 +141,7 @@ else:
         "SAVE_STEPS": "20",
         "EVAL_STEPS": "100",
         "RESUME": "1",
+        "MAX_STEPS": "500",
         "HF_TOKEN": "{HF_TOKEN}",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     }})
@@ -202,7 +203,7 @@ r = subprocess.run("tail -c 4000 /content/train.log 2>&1", shell=True, capture_o
 print(r.stdout)
 ''')
     r = run(f"colab exec -s {SESSION} -f /tmp/_rs_localstep.py --timeout 30", timeout=45)
-    matches = _re.findall(r"(\d+)/12538", r.stdout)
+    matches = _re.findall(r"(\d+)/\d+", r.stdout)
     if matches:
         return int(matches[-1])
     return None
