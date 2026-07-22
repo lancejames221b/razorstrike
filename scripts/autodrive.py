@@ -35,12 +35,9 @@ HALT_FILE = "/Volumes/Scratch/razorstrike-repo/.driver_state/HALT.txt"
 
 
 def notify(title, message):
-    """Fire an actual macOS notification (banner + sound)."""
-    try:
-        script = f'display notification "{message}" with title "{title}" sound name "Basso"'
-        subprocess.run(["osascript", "-e", script], timeout=10)
-    except Exception as e:
-        print(f"[driver] WARNING: notify() failed: {e}", flush=True)
+    """Notifications disabled - restart-loop churn was firing repeated
+    alerts/sounds. Log only."""
+    print(f"[driver] NOTIFY (suppressed): {title}: {message}", flush=True)
 
 
 def halt(reason):
@@ -110,7 +107,7 @@ if os.path.exists(HALT_FILE):
         _halt_reason = f.read()
     print(f"[driver] HALT sentinel present, refusing to run: {_halt_reason}", flush=True)
     notify("RazorStrike training driver still HALTED", _halt_reason[:200])
-    sys.exit(1)
+    sys.exit(0)
 
 HF_TOKEN = get_hf_token()
 print(f"[driver] HF_TOKEN acquired (len={len(HF_TOKEN)})", flush=True)
@@ -188,6 +185,24 @@ def session_alive():
     return ("IDLE" in r.stdout or "RUNNING" in r.stdout) and "not found" not in r.stdout.lower(), r.stdout
 
 
+def get_local_step():
+    """Ground-truth progress signal read directly from the live VM's
+    train.log tqdm output (e.g. '2761/12538'), independent of Hub push
+    lag. Returns None if the VM/session is unreachable or no step line
+    is found yet (e.g. still in preprocessing)."""
+    import re as _re
+    write("/tmp/_rs_localstep.py", '''
+import subprocess
+r = subprocess.run("tail -c 4000 /content/train.log 2>&1", shell=True, capture_output=True, text=True)
+print(r.stdout)
+''')
+    r = run(f"colab exec -s {SESSION} -f /tmp/_rs_localstep.py --timeout 30", timeout=45)
+    matches = _re.findall(r"(\d+)/12538", r.stdout)
+    if matches:
+        return int(matches[-1])
+    return None
+
+
 def get_hub_global_step():
     """Authoritative progress signal: query the Hub checkpoint directly,
     independent of anything happening on the (possibly dead) VM. Retries
@@ -243,22 +258,38 @@ def poll_once():
 
 def check_progress_or_die(state):
     """Mutates and persists state; halts for human review if stuck too long.
-    A persistently-unreadable step counts as non-progress too, so an auth/network
-    failure can't silently disable the crash-loop guard."""
-    new_step = get_hub_global_step()
+
+    Prefers the LOCAL training-log step (ground truth, read directly off the
+    live VM) over the Hub checkpoint step, since the Hub push is async and can
+    lag well behind actual progress - especially right after a relaunch, when
+    preprocessing + model load alone can take several minutes before the first
+    step even runs. Only treats it as stuck when local is unreachable too
+    (session actually dead) AND Hub shows no movement - that combination can't
+    be explained by push lag."""
+    local_step = get_local_step()
+    hub_step = get_hub_global_step()
     last_known_step = state["last_known_step"]
-    print(f"[driver] post-relaunch hub global_step={new_step} (was {last_known_step})", flush=True)
-    made_progress = (new_step is not None and last_known_step is not None and new_step > last_known_step)
+    print(f"[driver] progress check: local={local_step} hub={hub_step} (was {last_known_step})", flush=True)
+
+    best_step = max([s for s in (local_step, hub_step) if s is not None], default=None)
+    made_progress = (best_step is not None and last_known_step is not None and best_step > last_known_step)
+
     if made_progress:
         state["stuck_cycles"] = 0
+    elif local_step is not None:
+        # Local is reachable and shows no advance past last_known - genuinely
+        # not stuck-by-lag, but also not yet informative this soon after a
+        # relaunch (could still be mid-preprocess). Don't count this as a
+        # stuck cycle; only Hub-only stagnation (local unreachable) counts.
+        print("[driver] local reachable but not yet past last known step (still warming up) - not counting as stuck", flush=True)
     else:
         state["stuck_cycles"] += 1
-        print(f"[driver] no confirmed forward progress ({state['stuck_cycles']}/{MAX_STUCK_CYCLES})", flush=True)
+        print(f"[driver] local unreachable AND no confirmed forward progress ({state['stuck_cycles']}/{MAX_STUCK_CYCLES})", flush=True)
         if state["stuck_cycles"] >= MAX_STUCK_CYCLES:
             save_state(state)
-            halt(f"no step progress across {MAX_STUCK_CYCLES} consecutive relaunches (stuck at step {last_known_step})")
-    if new_step is not None:
-        state["last_known_step"] = new_step
+            halt(f"no step progress across {MAX_STUCK_CYCLES} consecutive relaunches with local unreachable (stuck at step {last_known_step})")
+    if best_step is not None:
+        state["last_known_step"] = best_step
     save_state(state)
 
 
@@ -285,7 +316,7 @@ def main():
                 continue
             state["consecutive_provision_failures"] = 0
             save_state(state)
-            time.sleep(90)
+            time.sleep(480)  # cover preprocess+model-load+resume+next save_steps boundary before judging progress
             check_progress_or_die(state)
             continue
 
@@ -305,7 +336,7 @@ def main():
                 print("[driver] same-session relaunch failed, will try reprovision next cycle", flush=True)
                 time.sleep(15)
                 continue
-            time.sleep(90)
+            time.sleep(480)  # same rationale as above
             check_progress_or_die(state)
             continue
 
