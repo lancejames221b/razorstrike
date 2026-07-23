@@ -55,38 +55,73 @@ if tok.pad_token is None:
 
 _kw = dict(dtype=torch.bfloat16, device_map="cuda", low_cpu_mem_usage=True)
 
-# Load order matters: the HAWQ base (lancejames221b/HAWQ) is a DARE-TIES merge
-# whose checkpoint keys are text-only causal-LM naming (language_model.*),
-# which matches Qwen3_5MoeForCausalLM but NOT the vision wrapper
-# Qwen3_5MoeForConditionalGeneration (expects model.language_model.*) produced
-# by AutoModelForImageTextToText. ImageTextToText does not raise on this
-# mismatch - it loads with MISSING keys (randomly-initialized weights) and
-# emits garbage. So try CausalLM FIRST (proven 0-MISSING on HAWQ), and only
-# fall back to ImageTextToText if CausalLM itself raises.
-_load_report = []
-try:
-    import io, contextlib
-    _buf = io.StringIO()
-    with contextlib.redirect_stdout(_buf):
-        model = AutoModelForCausalLM.from_pretrained(base_repo, **_kw)
-    _load_report.append(_buf.getvalue())
-except Exception as _e:
-    print(f"[eval] AutoModelForCausalLM failed ({type(_e).__name__}); "
-          f"trying AutoModelForImageTextToText", flush=True)
-    _buf = io.StringIO()
-    with contextlib.redirect_stdout(_buf):
-        model = AutoModelForImageTextToText.from_pretrained(base_repo, **_kw)
-    _load_report.append(_buf.getvalue())
+# HAWQ base (lancejames221b/HAWQ, a DARE-TIES merge) has malformed checkpoint
+# keys: they are prefixed `language_model.model.*` and `language_model.lm_head`,
+# but Qwen3_5MoeForCausalLM expects `model.*` / `lm_head.*`. The original
+# Qwen/Qwen3.6-35B-A3B base has keys `model.language_model.*` (correct for the
+# ConditionalGeneration wrapper). Neither load class matches HAWQ's keys as-is,
+# so from_pretrained loads with ~693 MISSING keys (random init -> garbage).
+# Fix: load with CausalLM, check missing_keys via output_loading_info (the real
+# list - transformers logs to stderr, NOT capturable via redirect_stdout), and
+# if MISSING keys are present, reload by manually remapping the state dict
+# (strip the leading `language_model.` prefix from every checkpoint key).
+def _load_base(repo):
+    """Load base with CausalLM-first, return (model, missing, unexpected)."""
+    try:
+        m, info = AutoModelForCausalLM.from_pretrained(
+            repo, output_loading_info=True, **_kw)
+        return m, info["missing_keys"], info["unexpected_keys"]
+    except Exception as e:
+        print(f"[eval] AutoModelForCausalLM failed ({type(e).__name__}); "
+              f"trying AutoModelForImageTextToText", flush=True)
+        m, info = AutoModelForImageTextToText.from_pretrained(
+            repo, output_loading_info=True, **_kw)
+        return m, info["missing_keys"], info["unexpected_keys"]
 
-# Guard: abort loudly if the load produced MISSING keys (random init). This is
-# the exact failure mode that manufactured garbled output on the first run -
-# never let it pass silently again.
-_full_report = "\n".join(_load_report)
-_missing = _full_report.count("MISSING")
-if _missing > 0:
-    print(f"[eval] FATAL: model loaded with {_missing} MISSING keys "
-          f"(checkpoint/model prefix mismatch). Aborting - weights are "
-          f"randomly initialized, eval would be meaningless.", flush=True)
+
+def _load_base_remapped(repo):
+    """Load base by remapping checkpoint keys (strip `language_model.` prefix)
+    so HAWQ's `language_model.model.*` -> `model.*` matches CausalLM. Loads
+    shards via safetensors, remaps, then load_state_dict onto a model
+    instantiated from config (no from_pretrained weight fetch)."""
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+    from transformers import AutoConfig
+    import glob, os
+    d = snapshot_download(repo)
+    # Gather all safetensors shards.
+    shards = sorted(glob.glob(os.path.join(d, "*.safetensors")))
+    print(f"[eval] remapping load: {len(shards)} shards from {d}", flush=True)
+    full_sd = {}
+    for s in shards:
+        full_sd.update(load_file(s))
+    remapped = {}
+    for k, v in full_sd.items():
+        nk = k[len("language_model."):] if k.startswith("language_model.") else k
+        remapped[nk] = v
+    cfg = AutoConfig.from_pretrained(repo)
+    m = AutoModelForCausalLM.from_config(cfg, **{k: _kw[k] for k in _kw if k != "device_map"})
+    m = m.to("cuda")
+    res = m.load_state_dict(remapped, strict=False)
+    print(f"[eval] remapped load: missing={len(res.missing_keys)} "
+          f"unexpected={len(res.unexpected_keys)}", flush=True)
+    return m, res.missing_keys, res.unexpected_keys
+
+
+model, _missing, _unexpected = _load_base(base_repo)
+if _missing:
+    print(f"[eval] direct load had {len(_missing)} missing keys; "
+          f"attempting key-remap load (strip language_model. prefix)", flush=True)
+    del model
+    import gc, torch as _t
+    gc.collect(); _t.cuda.empty_cache()
+    model, _missing, _unexpected = _load_base_remapped(base_repo)
+
+# Real guard: abort if STILL missing keys after remap.
+if _missing:
+    print(f"[eval] FATAL: model loaded with {len(_missing)} MISSING keys "
+          f"even after remap. Weights are randomly initialized; eval would be "
+          f"meaningless. Sample missing: {list(_missing)[:5]}", flush=True)
     sys.exit(2)
 
 if not no_adapter:
