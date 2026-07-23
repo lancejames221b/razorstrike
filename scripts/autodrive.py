@@ -153,11 +153,11 @@ else:
         ckpt_dirs = [f for f in files if f.startswith("checkpoint-")]
         if ckpt_dirs:
             env["RESUME"] = "1"
-            print(f"RESUME=1 ({len(ckpt_dirs)} checkpoints found on Hub)")
+            print("RESUME=1 ({{}} checkpoints found on Hub)".format(len(ckpt_dirs)))
         else:
             print("RESUME not set (no checkpoint dirs on Hub - fresh run)")
     except Exception as e:
-        print(f"RESUME not set (repo check failed: {type(e).__name__})")
+        print("RESUME not set (repo check failed: {{}})".format(type(e).__name__))
     cmd = "cd /content/razorstrike && nohup python3 -m scripts.train_lora > /content/train.log 2>&1 &"
     subprocess.Popen(cmd, shell=True, env=env)
     time.sleep(3)
