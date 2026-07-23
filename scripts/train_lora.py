@@ -19,12 +19,14 @@ Reads env: BASE_REPO (default Qwen/Qwen3.6-35B-A3B), DATA_REPO, OUT_DIR,
   LORA_ALPHA(64), SAVE_STEPS(50), EVAL_STEPS(250), RESUME.
 """
 
-import os, torch
+import os, torch, glob
 from transformers import (AutoModelForImageTextToText, AutoModelForCausalLM,
                           AutoTokenizer,
-                          Trainer, TrainingArguments, DataCollatorForSeq2Seq)
+                          Trainer, TrainingArguments, DataCollatorForSeq2Seq,
+                          TrainerCallback)
 from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
+from huggingface_hub import upload_folder
 
 BASE   = os.environ.get("BASE_REPO", "Qwen/Qwen3.6-35B-A3B")
 DATA   = os.environ["DATA_REPO"]           # lancejames221b/razorstrike-v2-sft
@@ -108,15 +110,41 @@ args = TrainingArguments(
     save_steps=int(os.environ.get("SAVE_STEPS", "50")), save_total_limit=3,
     eval_strategy="steps", eval_steps=int(os.environ.get("EVAL_STEPS", "250")), optim="adamw_torch",
     report_to="none", dataloader_num_workers=2,
-    # Durable checkpointing: push the latest checkpoint to the Hub every
-    # save_steps, so a VM reclamation loses at most one save interval, not
-    # the whole run. Resumable via `last-checkpoint` in ADAPTER_REPO.
-    push_to_hub=True, hub_model_id=ADAPTER_REPO, hub_token=HF_TOKEN,
-    hub_private_repo=False, hub_strategy="all_checkpoints", hub_always_push=True, prediction_loss_only=True)
+    # Durable checkpointing via custom blocking-push callback (see below).
+    # The built-in push_to_hub=True uses async Futures that silently swallow
+    # errors (huggingface/transformers#29399 + Future exception swallowing).
+    # We disable it and use our own callback that does blocking uploads.
+    push_to_hub=False, prediction_loss_only=True)
+
+
+class HubCheckpointPusher(TrainerCallback):
+    """Blocking push of each checkpoint to the Hub after every save.
+    Unlike push_to_hub=True, this uses run_as_future=False so upload errors
+    are raised synchronously and logged, not silently swallowed."""
+    def on_save(self, args, state, control, **kwargs):
+        ckpts = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")),
+                       key=lambda p: int(p.split("-")[-1]))
+        if not ckpts:
+            return
+        latest = ckpts[-1]
+        name = os.path.basename(latest)
+        try:
+            upload_folder(
+                repo_id=ADAPTER_REPO,
+                folder_path=latest,
+                path_in_repo=name,
+                token=HF_TOKEN,
+                run_as_future=False,
+            )
+            print(f"[push] {name} -> Hub OK", flush=True)
+        except Exception as e:
+            print(f"[push] {name} FAIL {type(e).__name__}: {e}", flush=True)
+
 
 trainer = Trainer(model=model, args=args,
     train_dataset=ds["train"], eval_dataset=ds["validation"],
-    data_collator=DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True))
+    data_collator=DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True),
+    callbacks=[HubCheckpointPusher()])
 
 resume_path = None
 if os.environ.get("RESUME"):
