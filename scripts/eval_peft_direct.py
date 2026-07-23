@@ -99,6 +99,12 @@ def _load_base_remapped(repo):
     for s in shards:
         for k, v in load_file(s).items():
             nk = k[len("language_model."):] if k.startswith("language_model.") else k
+            # conv1d weight layout fix: HAWQ's SSM/linear-attn merge saved
+            # conv1d.weight as [C, K, 1] (fla/SSM convention) but transformers'
+            # nn.Conv1d expects [C, 1, K]. Transpose dims 1<->2 for these keys.
+            if nk.endswith("linear_attn.conv1d.weight") and v.dim() == 3:
+                if v.shape[1] != 1 and v.shape[2] == 1:
+                    v = v.transpose(1, 2).contiguous()
             remapped[nk] = v.to("cuda", dtype=torch.bfloat16)
     cfg = AutoConfig.from_pretrained(repo)
     with init_empty_weights():
