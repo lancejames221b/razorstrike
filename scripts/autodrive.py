@@ -144,15 +144,20 @@ else:
         "HF_TOKEN": "{HF_TOKEN}",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     }})
-    # Only set RESUME=1 if the adapter repo already has a checkpoint to resume from.
-    # On a fresh run (new adapter repo), RESUME=1 causes "Can't find a valid checkpoint" crash.
+    # Only set RESUME=1 if the adapter repo already has a checkpoint-N/ dir to resume from.
+    # The HubCheckpointPusher callback pushes checkpoints as checkpoint-N/ dirs at repo root,
+    # not as last-checkpoint/ (which the old Trainer hub_strategy=checkpoint never created).
     try:
-        from huggingface_hub import hf_hub_download
-        hf_hub_download("{ADAPTER_FULL}", "last-checkpoint/trainer_state.json", token="{HF_TOKEN}")
-        env["RESUME"] = "1"
-        print("RESUME=1 (checkpoint found)")
-    except Exception:
-        print("RESUME not set (no checkpoint yet - fresh run)")
+        from huggingface_hub import list_repo_files
+        files = list_repo_files("{ADAPTER_FULL}", token="{HF_TOKEN}")
+        ckpt_dirs = [f for f in files if f.startswith("checkpoint-")]
+        if ckpt_dirs:
+            env["RESUME"] = "1"
+            print(f"RESUME=1 ({len(ckpt_dirs)} checkpoints found on Hub)")
+        else:
+            print("RESUME not set (no checkpoint dirs on Hub - fresh run)")
+    except Exception as e:
+        print(f"RESUME not set (repo check failed: {type(e).__name__})")
     cmd = "cd /content/razorstrike && nohup python3 -m scripts.train_lora > /content/train.log 2>&1 &"
     subprocess.Popen(cmd, shell=True, env=env)
     time.sleep(3)
@@ -229,11 +234,17 @@ def get_hub_global_step():
     huggingface_hub installed, silently producing empty stdout -> int('')
     failure on every attempt. Importing directly here removes that
     ambiguity entirely."""
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import list_repo_files, hf_hub_download
     import json as _json
     for attempt in range(3):
         try:
-            p = hf_hub_download(ADAPTER_FULL, "last-checkpoint/trainer_state.json", token=HF_TOKEN)
+            files = list_repo_files(ADAPTER_FULL, token=HF_TOKEN)
+            ckpt_dirs = sorted({f.split("/")[0] for f in files if f.startswith("checkpoint-")},
+                               key=lambda s: int(s.split("-")[1]))
+            if not ckpt_dirs:
+                return None
+            latest = ckpt_dirs[-1]
+            p = hf_hub_download(ADAPTER_FULL, f"{latest}/trainer_state.json", token=HF_TOKEN)
             with open(p) as f:
                 step = _json.load(f).get("global_step")
             return int(step)
