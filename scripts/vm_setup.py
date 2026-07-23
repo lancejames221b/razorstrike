@@ -46,7 +46,12 @@ def main():
     # All deps in one pass, idempotent (pip no-ops if already satisfied).
     deps = [
         "transformers==5.14.1",
-        "peft>=0.14",
+        "peft==0.18.0",          # peft>=0.19 breaks: WeightConverter.__init__() got
+                                  # unexpected kwarg 'distributed_operation' against
+                                  # transformers 5.14.1's core_model_loading API.
+                                  # peft<0.18 breaks: HybridCache import removed from
+                                  # this transformers version. 0.18.0 verified compatible
+                                  # (base load + LoRA merge_and_unload both clean).
         "accelerate>=1.0",
         "datasets>=3.0",
         "huggingface_hub",
