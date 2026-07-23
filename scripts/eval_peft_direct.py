@@ -100,7 +100,15 @@ def _load_base_remapped(repo):
     _up_bufs = {}     # layer_prefix -> up_proj tensor, awaiting fusion with gate_proj
     for s in shards:
         for k, v in load_file(s).items():
-            nk = k[len("language_model."):] if k.startswith("language_model.") else k
+            # AutoModelForCausalLM instantiates the TEXT-ONLY backbone
+            # (Qwen3_5MoeForCausalLM) - it has no vision tower or multi-token-
+            # prediction head. Only remap keys that originate under the
+            # checkpoint's `language_model.*` prefix; everything else
+            # (`model.visual.*`, `mtp.*`) belongs to submodules this class
+            # doesn't have and must be dropped, not loaded.
+            if not k.startswith("language_model."):
+                continue
+            nk = k[len("language_model."):]
             # conv1d weight layout fix: HAWQ's SSM/linear-attn merge saved
             # conv1d.weight as [C, K, 1] (fla/SSM convention) but transformers'
             # nn.Conv1d expects [C, 1, K]. Transpose dims 1<->2 for these keys.
