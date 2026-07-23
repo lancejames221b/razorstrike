@@ -124,7 +124,7 @@ print(r0.stdout, r0.stderr[-300:])
 if "HF_LOGIN_OK" not in r0.stdout:
     print("HF_LOGIN_FAILED - aborting launch")
 else:
-    r1 = subprocess.run("test -d /content/razorstrike && cd /content/razorstrike && git pull --ff-only 2>&1 || (rm -rf /content/razorstrike && git clone --depth 1 https://github.com/lancejames221b/razorstrike.git /content/razorstrike 2>&1)", shell=True, capture_output=True, text=True)
+    r1 = subprocess.run("test -d /content/razorstrike && cd /content/razorstrike && git fetch origin && git reset --hard origin/main 2>&1 || (rm -rf /content/razorstrike && git clone --depth 1 https://github.com/lancejames221b/razorstrike.git /content/razorstrike 2>&1)", shell=True, capture_output=True, text=True)
     print("SYNC:", r1.stdout[-300:])
     r2 = subprocess.run("cd /content/razorstrike && python3 scripts/vm_setup.py 2>&1 | tail -25", shell=True, capture_output=True, text=True, timeout=300)
     print("SETUP:", r2.stdout)
