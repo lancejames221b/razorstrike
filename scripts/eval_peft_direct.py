@@ -81,31 +81,34 @@ def _load_base(repo):
 
 def _load_base_remapped(repo):
     """Load base by remapping checkpoint keys (strip `language_model.` prefix)
-    so HAWQ's `language_model.model.*` -> `model.*` matches CausalLM. Loads
-    shards via safetensors, remaps, then load_state_dict onto a model
-    instantiated from config (no from_pretrained weight fetch)."""
+    so HAWQ's `language_model.model.*` -> `model.*` matches CausalLM. Memory-
+    safe: builds the model on meta device (init_empty_weights, zero real
+    memory), then load_state_dict(assign=True) places the real remapped tensors
+    directly onto the meta params (no copy, no 2x peak). strict=True after a
+    correct remap; anything still off raises immediately instead of silently
+    running on random weights."""
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
     from transformers import AutoConfig
+    from accelerate import init_empty_weights
     import glob, os
     d = snapshot_download(repo)
-    # Gather all safetensors shards.
     shards = sorted(glob.glob(os.path.join(d, "*.safetensors")))
     print(f"[eval] remapping load: {len(shards)} shards from {d}", flush=True)
-    full_sd = {}
-    for s in shards:
-        full_sd.update(load_file(s))
     remapped = {}
-    for k, v in full_sd.items():
-        nk = k[len("language_model."):] if k.startswith("language_model.") else k
-        remapped[nk] = v
+    for s in shards:
+        for k, v in load_file(s).items():
+            nk = k[len("language_model."):] if k.startswith("language_model.") else k
+            remapped[nk] = v.to("cuda", dtype=torch.bfloat16)
     cfg = AutoConfig.from_pretrained(repo)
-    m = AutoModelForCausalLM.from_config(cfg, **{k: _kw[k] for k in _kw if k != "device_map"})
+    with init_empty_weights():
+        m = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16)
+    # assign=True: place real tensors onto meta params directly (no copy).
+    res = m.load_state_dict(remapped, strict=True, assign=True)
     m = m.to("cuda")
-    res = m.load_state_dict(remapped, strict=False)
     print(f"[eval] remapped load: missing={len(res.missing_keys)} "
           f"unexpected={len(res.unexpected_keys)}", flush=True)
-    return m, res.missing_keys, res.unexpected_keys
+    return m, list(res.missing_keys), list(res.unexpected_keys)
 
 
 model, _missing, _unexpected = _load_base(base_repo)
