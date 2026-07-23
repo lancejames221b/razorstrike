@@ -112,7 +112,7 @@ args = TrainingArguments(
     # save_steps, so a VM reclamation loses at most one save interval, not
     # the whole run. Resumable via `last-checkpoint` in ADAPTER_REPO.
     push_to_hub=True, hub_model_id=ADAPTER_REPO, hub_token=HF_TOKEN,
-    hub_private_repo=True, hub_strategy="checkpoint", prediction_loss_only=True)
+    hub_private_repo=True, hub_strategy="all", prediction_loss_only=True)
 
 trainer = Trainer(model=model, args=args,
     train_dataset=ds["train"], eval_dataset=ds["validation"],
@@ -120,14 +120,21 @@ trainer = Trainer(model=model, args=args,
 
 resume_path = None
 if os.environ.get("RESUME"):
-    # Pull the last checkpoint back from the Hub (local OUT may be gone after
-    # a VM churn) before resuming.
-    from huggingface_hub import snapshot_download
+    # With hub_strategy="all", checkpoints push to the Hub repo root as
+    # checkpoint-N/ dirs. Pull the highest-numbered one and resume from it.
+    from huggingface_hub import list_repo_files, snapshot_download
     try:
-        ck_dir = snapshot_download(ADAPTER_REPO, allow_patterns="last-checkpoint/*",
-                                   token=HF_TOKEN, local_dir=OUT)
-        resume_path = os.path.join(OUT, "last-checkpoint")
-        print(f"[resume] pulled checkpoint from hub -> {resume_path}")
+        files = list_repo_files(ADAPTER_REPO, token=HF_TOKEN)
+        ckpt_dirs = sorted({f.split("/")[0] for f in files if f.startswith("checkpoint-")},
+                            key=lambda s: int(s.split("-")[1]))
+        if ckpt_dirs:
+            latest = ckpt_dirs[-1]
+            snapshot_download(ADAPTER_REPO, allow_patterns=[f"{latest}/*"],
+                               token=HF_TOKEN, local_dir=OUT)
+            resume_path = os.path.join(OUT, latest)
+            print(f"[resume] pulled {latest} from hub -> {resume_path}")
+        else:
+            print("[resume] no checkpoint dirs on hub; starting fresh")
     except Exception as e:
         print(f"[resume] no hub checkpoint found ({type(e).__name__}: {e}); starting fresh")
 
