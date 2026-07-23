@@ -54,17 +54,48 @@ if tok.pad_token is None:
     tok.pad_token = tok.eos_token
 
 _kw = dict(dtype=torch.bfloat16, device_map="cuda", low_cpu_mem_usage=True)
+
+# Load order matters: the HAWQ base (lancejames221b/HAWQ) is a DARE-TIES merge
+# whose checkpoint keys are text-only causal-LM naming (language_model.*),
+# which matches Qwen3_5MoeForCausalLM but NOT the vision wrapper
+# Qwen3_5MoeForConditionalGeneration (expects model.language_model.*) produced
+# by AutoModelForImageTextToText. ImageTextToText does not raise on this
+# mismatch - it loads with MISSING keys (randomly-initialized weights) and
+# emits garbage. So try CausalLM FIRST (proven 0-MISSING on HAWQ), and only
+# fall back to ImageTextToText if CausalLM itself raises.
+_load_report = []
 try:
-    model = AutoModelForImageTextToText.from_pretrained(base_repo, **_kw)
-except Exception:
-    model = AutoModelForCausalLM.from_pretrained(base_repo, **_kw)
+    import io, contextlib
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        model = AutoModelForCausalLM.from_pretrained(base_repo, **_kw)
+    _load_report.append(_buf.getvalue())
+except Exception as _e:
+    print(f"[eval] AutoModelForCausalLM failed ({type(_e).__name__}); "
+          f"trying AutoModelForImageTextToText", flush=True)
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        model = AutoModelForImageTextToText.from_pretrained(base_repo, **_kw)
+    _load_report.append(_buf.getvalue())
+
+# Guard: abort loudly if the load produced MISSING keys (random init). This is
+# the exact failure mode that manufactured garbled output on the first run -
+# never let it pass silently again.
+_full_report = "\n".join(_load_report)
+_missing = _full_report.count("MISSING")
+if _missing > 0:
+    print(f"[eval] FATAL: model loaded with {_missing} MISSING keys "
+          f"(checkpoint/model prefix mismatch). Aborting - weights are "
+          f"randomly initialized, eval would be meaningless.", flush=True)
+    sys.exit(2)
 
 if not no_adapter:
     model = PeftModel.from_pretrained(model, adapter_dir)
     model = model.merge_and_unload()
 model.eval()
 print(f"[eval] model loaded{'+ merged' if not no_adapter else ''}, "
-      f"{sum(p.numel() for p in model.parameters()):,} params", flush=True)
+      f"{sum(p.numel() for p in model.parameters()):,} params "
+      f"({type(model).__name__})", flush=True)
 
 # Load the base generation config once; prefer its top_k/min_p if present
 # (card-grounded, but the repo may already encode them).
