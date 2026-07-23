@@ -140,11 +140,19 @@ else:
         "TARGET_MLP": "0",
         "SAVE_STEPS": "20",
         "EVAL_STEPS": "100",
-        "RESUME": "1",
         "MAX_STEPS": "500",
         "HF_TOKEN": "{HF_TOKEN}",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     }})
+    # Only set RESUME=1 if the adapter repo already has a checkpoint to resume from.
+    # On a fresh run (new adapter repo), RESUME=1 causes "Can't find a valid checkpoint" crash.
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_hub_download("{ADAPTER_FULL}", "last-checkpoint/trainer_state.json", token="{HF_TOKEN}")
+        env["RESUME"] = "1"
+        print("RESUME=1 (checkpoint found)")
+    except Exception:
+        print("RESUME not set (no checkpoint yet - fresh run)")
     cmd = "cd /content/razorstrike && nohup python3 -m scripts.train_lora > /content/train.log 2>&1 &"
     subprocess.Popen(cmd, shell=True, env=env)
     time.sleep(3)
