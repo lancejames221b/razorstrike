@@ -18,11 +18,11 @@ import torch
 from transformers import AutoModelForImageTextToText, AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-BASE         = os.environ.get("BASE_REPO", "Qwen/Qwen3.6-35B-A3B")
+BASE         = os.environ.get("BASE_REPO", "lancejames221b/HAWQ")
 ADAPTER_DIR  = os.environ.get("ADAPTER_DIR", "/content/adapter")
-ADAPTER_REPO = os.environ.get("ADAPTER_REPO", "lancejames221b/razorstrike-v2-offsec-lora")
+ADAPTER_REPO = os.environ.get("ADAPTER_REPO", "lancejames221b/HAWQ-SEC-re-validation-lora")
 MERGED_DIR   = os.environ.get("MERGED_DIR", "/content/merged")
-MERGED_REPO  = os.environ.get("MERGED_REPO", "lancejames221b/razorstrike-v2")
+MERGED_REPO  = os.environ.get("MERGED_REPO", "lancejames221b/HAWQ-RE")
 TOKEN        = os.environ.get("HF_TOKEN")
 
 MODEL_CARD = f"""---
