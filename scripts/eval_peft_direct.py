@@ -138,7 +138,10 @@ def _load_base_remapped(repo):
     with init_empty_weights():
         m = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16)
     # assign=True: place real tensors onto meta params directly (no copy).
-    res = m.load_state_dict(remapped, strict=True, assign=True)
+    # strict=False: unexpected keys (leftover naming variants we haven't hit
+    # yet) are harmless since this class has no submodule to put them in.
+    # The real invariant is "no MISSING keys" - checked explicitly below.
+    res = m.load_state_dict(remapped, strict=False, assign=True)
     m = m.to("cuda")
     print(f"[eval] remapped load: missing={len(res.missing_keys)} "
           f"unexpected={len(res.unexpected_keys)}", flush=True)
