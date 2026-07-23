@@ -106,8 +106,9 @@ def main():
     with open(os.path.join(MERGED_DIR, "README.md"), "w") as f:
         f.write(MODEL_CARD)
 
-    m.push_to_hub(MERGED_REPO, private=False, token=TOKEN)
-    tok.push_to_hub(MERGED_REPO, private=False, token=TOKEN)
+    _pub = os.environ.get("PUBLISH_PUBLIC", "0") == "1"
+    m.push_to_hub(MERGED_REPO, private=not _pub, token=TOKEN)
+    tok.push_to_hub(MERGED_REPO, private=not _pub, token=TOKEN)
     from huggingface_hub import upload_file
     upload_file(path_or_fileobj=os.path.join(MERGED_DIR, "README.md"), path_in_repo="README.md",
                 repo_id=MERGED_REPO, repo_type="model", token=TOKEN)
