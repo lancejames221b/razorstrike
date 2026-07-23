@@ -45,30 +45,22 @@ pipeline_tag: image-text-to-text
 library_name: transformers
 ---
 
-# RazorStrike-v2
+# HAWQ-RE
 
-RazorStrike-v2 is a multi-domain **LoRA SFT** fine-tune merged into the clean
-**{BASE}** base (hybrid linear-attention/SSM MoE architecture). Unlike v1
-(a task-arithmetic donor merge), v2 is trained from scratch on curated data
-across reverse engineering, cryptography (including ransomware key-recovery
-strategy), offensive security, applied math, and anti-repetition-loop traces -
-directly targeting the reasoning-loop behavior identified in v1.
+HAWQ-RE is a **LoRA SFT** fine-tune of the **HAWQ** base
+({BASE}), a Holo3+Qwopus+AgentWorld merge on Qwen3.6-35B-A3B (hybrid
+linear-attention/SSM MoE architecture, 256 experts, vision tower intact).
+The LoRA adapter is trained on reverse-engineering (decompile-bench) and
+anti-loop recovery data, then merged back into the base.
 
 ## Training
 
-- Base: `{BASE}` (clean, no donor merge)
+- Base: `{BASE}` (Holo3+Qwopus+AgentWorld merge on Qwen3.6-35B-A3B)
 - Method: LoRA SFT via `transformers` + `peft`, response-only prompt-prefix
   masking (no TRL, avoiding a v5-transformers compatibility risk)
-- Data: `lancejames221b/razorstrike-v2-sft` - RE foundation, crypto primitives,
-  crypto_id, ransomware-crypto key recovery, math (NuminaMath-CoT derived),
-  offensive-security/investigations, and anti-doom-loop traces
-- 2 epochs, `MAXLEN=3072`, LoRA rank/alpha per `adapter_config.json`
-
-## Known-issue context
-
-RazorStrike-v1 could fall into repetitive token loops during long reasoning
-traces beyond what `repetition_penalty` alone fixes. v2's anti-loop training
-data and from-scratch (non-merge) construction directly target this.
+- Data: `lancejames221b/HAWQ-SEC-re-validation` - RE foundation (decompile-bench)
+  and anti-doom-loop traces
+- MAX_STEPS=500, `MAXLEN=3072`, LoRA rank/alpha per `adapter_config.json`
 
 ## License
 

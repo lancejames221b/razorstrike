@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 """Lightweight post-training eval: load HAWQ base + LoRA adapter directly,
-serve via a minimal OpenAI-compatible shim on localhost, run eval_loop_recovery probes.
-
-Run on the Colab VM after training completes. No merge/quantize/MLX needed.
+run eval probes (tool_loop, error_recovery, long_cot) on the Colab GPU.
+No merge/quantize/MLX needed - loads base+adapter in-process.
 
 Usage:
-  python3 scripts/eval_peft_direct.py --adapter-dir /content/adapter --base lancejames221b/HAWQ
+  python3 scripts/eval_peft_direct.py --adapter-dir /content/adapter/last-checkpoint --base lancejames221b/HAWQ
 """
 
-import os, sys, json, time, re, threading, subprocess
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import os, sys, json, time, re, subprocess
 
-# Parse args
-adapter_dir = "/content/adapter"
+adapter_dir = "/content/adapter/last-checkpoint"
 base_repo = "lancejames221b/HAWQ"
-port = 8089
 
 for i, arg in enumerate(sys.argv):
     if arg == "--adapter-dir" and i+1 < len(sys.argv):
         adapter_dir = sys.argv[i+1]
     elif arg == "--base" and i+1 < len(sys.argv):
         base_repo = sys.argv[i+1]
-    elif arg == "--port" and i+1 < len(sys.argv):
-        port = int(sys.argv[i+1])
 
 print(f"[eval] loading {base_repo} + adapter from {adapter_dir}", flush=True)
 
