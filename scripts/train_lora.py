@@ -122,6 +122,7 @@ class HubCheckpointPusher(TrainerCallback):
     Unlike push_to_hub=True, this uses run_as_future=False so upload errors
     are raised synchronously and logged, not silently swallowed."""
     def on_save(self, args, state, control, **kwargs):
+        from huggingface_hub import create_repo
         ckpts = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")),
                        key=lambda p: int(p.split("-")[-1]))
         if not ckpts:
@@ -129,6 +130,7 @@ class HubCheckpointPusher(TrainerCallback):
         latest = ckpts[-1]
         name = os.path.basename(latest)
         try:
+            create_repo(ADAPTER_REPO, token=HF_TOKEN, exist_ok=True, private=False)
             upload_folder(
                 repo_id=ADAPTER_REPO,
                 folder_path=latest,
