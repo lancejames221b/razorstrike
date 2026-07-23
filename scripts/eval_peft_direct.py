@@ -96,6 +96,8 @@ def _load_base_remapped(repo):
     shards = sorted(glob.glob(os.path.join(d, "*.safetensors")))
     print(f"[eval] remapping load: {len(shards)} shards from {d}", flush=True)
     remapped = {}
+    _gate_bufs = {}   # layer_prefix -> gate_proj tensor, awaiting fusion with up_proj
+    _up_bufs = {}     # layer_prefix -> up_proj tensor, awaiting fusion with gate_proj
     for s in shards:
         for k, v in load_file(s).items():
             nk = k[len("language_model."):] if k.startswith("language_model.") else k
@@ -105,7 +107,25 @@ def _load_base_remapped(repo):
             if nk.endswith("linear_attn.conv1d.weight") and v.dim() == 3:
                 if v.shape[1] != 1 and v.shape[2] == 1:
                     v = v.transpose(1, 2).contiguous()
+            # MoE expert naming fix: HAWQ saved separate switch_mlp.gate_proj /
+            # switch_mlp.up_proj / switch_mlp.down_proj ([E,512,2048] each),
+            # but the model expects a single fused experts.gate_up_proj
+            # ([E,1024,2048] = cat(gate,up) dim=1) and experts.down_proj (same
+            # shape as switch_mlp.down_proj, just renamed - no data change).
+            if ".mlp.switch_mlp.gate_proj.weight" in nk:
+                _gate_bufs[nk.replace(".mlp.switch_mlp.gate_proj.weight", "")] = v
+                continue
+            if ".mlp.switch_mlp.up_proj.weight" in nk:
+                _up_bufs[nk.replace(".mlp.switch_mlp.up_proj.weight", "")] = v
+                continue
+            if ".mlp.switch_mlp.down_proj.weight" in nk:
+                nk = nk.replace(".mlp.switch_mlp.down_proj.weight", ".mlp.experts.down_proj")
             remapped[nk] = v.to("cuda", dtype=torch.bfloat16)
+    # Fuse buffered gate/up pairs now that both halves are loaded.
+    for layer_prefix, gate_v in _gate_bufs.items():
+        up_v = _up_bufs[layer_prefix]
+        fused = torch.cat([gate_v, up_v], dim=1)
+        remapped[layer_prefix + ".mlp.experts.gate_up_proj"] = fused.to("cuda", dtype=torch.bfloat16)
     cfg = AutoConfig.from_pretrained(repo)
     with init_empty_weights():
         m = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16)
