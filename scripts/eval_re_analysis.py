@@ -121,6 +121,11 @@ def judge(base_url, model, api_key, asm, code, analysis_a, analysis_b):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", default="eval_re_tasks.jsonl")
+    ap.add_argument("--from-json", default=None,
+                     help="pre-generated {asm, code, base_analysis, tuned_analysis} "
+                          "rows (from gen_re_analyses.py) - skips HTTP generation "
+                          "entirely, useful when no hawq/hawq-sec-re endpoint is "
+                          "being served")
     ap.add_argument("--base-url", default=os.environ.get("BASE_URL", "http://generic:1234/v1"))
     ap.add_argument("--base-model", default=os.environ.get("BASE_MODEL", "hawq"))
     ap.add_argument("--tuned-url", default=os.environ.get("TUNED_URL", "http://generic:1234/v1"))
@@ -130,15 +135,20 @@ def main():
 
     frontier_url, frontier_model, frontier_key = _frontier_env()
 
-    tasks = []
-    with open(args.tasks) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                tasks.append(json.loads(line))
-    print(f"[eval] {len(tasks)} held-out tasks from {args.tasks}")
-    print(f"[eval] base: {args.base_model} @ {args.base_url}")
-    print(f"[eval] tuned: {args.tuned_model} @ {args.tuned_url}")
+    if args.from_json:
+        with open(args.from_json) as f:
+            tasks = json.load(f)
+        print(f"[eval] {len(tasks)} pre-generated rows from {args.from_json}")
+    else:
+        tasks = []
+        with open(args.tasks) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    tasks.append(json.loads(line))
+        print(f"[eval] {len(tasks)} held-out tasks from {args.tasks}")
+        print(f"[eval] base: {args.base_model} @ {args.base_url}")
+        print(f"[eval] tuned: {args.tuned_model} @ {args.tuned_url}")
     print(f"[eval] judge: {frontier_model} @ {frontier_url}")
 
     random.seed(1337)
@@ -147,13 +157,17 @@ def main():
 
     for i, task in enumerate(tasks):
         asm, code = task["asm"], task["code"]
-        try:
-            base_analysis = get_analysis(args.base_url, args.base_model, asm)
-            tuned_analysis = get_analysis(args.tuned_url, args.tuned_model, asm)
-        except Exception as e:
-            print(f"[{i}] generation FAILED: {type(e).__name__}: {e}")
-            errors += 1
-            continue
+        if args.from_json:
+            base_analysis = task["base_analysis"]
+            tuned_analysis = task["tuned_analysis"]
+        else:
+            try:
+                base_analysis = get_analysis(args.base_url, args.base_model, asm)
+                tuned_analysis = get_analysis(args.tuned_url, args.tuned_model, asm)
+            except Exception as e:
+                print(f"[{i}] generation FAILED: {type(e).__name__}: {e}")
+                errors += 1
+                continue
 
         # Randomize A/B order to avoid position bias.
         tuned_is_a = random.random() < 0.5
