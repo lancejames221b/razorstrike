@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--adapter-dir", default="/content/adapter")
     ap.add_argument("--out", default="gen_results.json")
     ap.add_argument("--max-new-tokens", type=int, default=1800)
+    ap.add_argument("--batch-size", type=int, default=8)
     args = ap.parse_args()
 
     tasks = []
@@ -64,6 +65,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.base_repo)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    tok.padding_side = "left"  # required for correct batched generation
 
     _kw = dict(dtype=torch.bfloat16, device_map="auto", low_cpu_mem_usage=True)
     print("[gen] loading base model", flush=True)
@@ -75,24 +77,36 @@ def main():
     if isinstance(_im_end_id, int) and _im_end_id != tok.eos_token_id and _im_end_id >= 0:
         eos_ids.add(_im_end_id)
 
-    def generate(prompt_text):
-        inputs = tok(prompt_text, return_tensors="pt").to(model.device)
+    def generate_batch(prompt_texts):
+        inputs = tok(prompt_texts, return_tensors="pt", padding=True).to(model.device)
         with torch.no_grad():
             out = model.generate(
                 **inputs, max_new_tokens=args.max_new_tokens,
                 do_sample=True, temperature=0.6, top_p=0.95,
                 pad_token_id=tok.pad_token_id, eos_token_id=list(eos_ids))
-        gen_ids = out[0][inputs["input_ids"].shape[1]:]
-        return tok.decode(gen_ids, skip_special_tokens=True).strip()
+        gen_ids = out[:, inputs["input_ids"].shape[1]:]
+        return [tok.decode(g, skip_special_tokens=True).strip() for g in gen_ids]
+
+    BATCH = args.batch_size
+
+    def generate_all(items, key_fn):
+        """items: list of dicts with 'asm'; returns list of generated strings in order."""
+        out_texts = [None] * len(items)
+        for start in range(0, len(items), BATCH):
+            chunk = items[start:start + BATCH]
+            prompts = [build_prompt(tok, it["asm"]) for it in chunk]
+            texts = generate_batch(prompts)
+            for j, txt in enumerate(texts):
+                out_texts[start + j] = txt
+            done = min(start + BATCH, len(items))
+            print(f"[gen] {key_fn} {done}/{len(items)}", flush=True)
+        return out_texts
 
     results = []
     print("[gen] generating BASE analyses", flush=True)
-    for i, t in enumerate(tasks):
-        prompt = build_prompt(tok, t["asm"])
-        base_text = generate(prompt)
+    base_texts = generate_all(tasks, "base")
+    for t, base_text in zip(tasks, base_texts):
         results.append({"asm": t["asm"], "code": t["code"], "base_analysis": base_text})
-        if (i + 1) % 10 == 0:
-            print(f"[gen] base {i + 1}/{len(tasks)}", flush=True)
 
     del model
     import gc
@@ -107,11 +121,10 @@ def main():
     model = tuned
 
     print("[gen] generating TUNED analyses", flush=True)
-    for i, r in enumerate(results):
-        prompt = build_prompt(tok, r["asm"])
-        r["tuned_analysis"] = generate(prompt)
-        if (i + 1) % 10 == 0:
-            print(f"[gen] tuned {i + 1}/{len(results)}", flush=True)
+    tuned_texts = generate_all(results, "tuned")
+    for r, tuned_text in zip(results, tuned_texts):
+        r["tuned_analysis"] = tuned_text
+
 
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
