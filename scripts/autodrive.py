@@ -28,7 +28,7 @@ import json
 import os
 
 SESSION = "rs-g4"
-ADAPTER_FULL = "lancejames221b/HAWQ-SEC-re-validation-lora"
+ADAPTER_FULL = "lancejames221b/HAWQ-SEC-lora"
 MAX_STUCK_CYCLES = 5
 STATE_FILE = "/Volumes/Scratch/razorstrike-repo/.driver_state/state.json"
 HALT_FILE = "/Volumes/Scratch/razorstrike-repo/.driver_state/HALT.txt"
@@ -132,15 +132,16 @@ else:
     time.sleep(2)
     env = os.environ.copy()
     env.update({{
-        "BASE_REPO": "lancejames221b/HAWQ",
-        "DATA_REPO": "lancejames221b/HAWQ-SEC-re-validation",
+        "BASE_REPO": "lancejames221b/HAWQ-v1",
+        "DATA_REPO": "lancejames221b/hawq-sec-sft",
         "ADAPTER_REPO": "{ADAPTER_FULL}",
         "OUT_DIR": "/content/adapter",
         "MAXLEN": "3072",
         "TARGET_MLP": "0",
-        "SAVE_STEPS": "20",
-        "EVAL_STEPS": "100",
-        "MAX_STEPS": "500",
+        "SAVE_STEPS": "250",
+        "EVAL_STEPS": "250",
+        "MAX_STEPS": "-1",
+        "FORCE_CAUSAL_LM": "1",
         "HF_TOKEN": "{HF_TOKEN}",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     }})

@@ -18,11 +18,11 @@ import torch
 from transformers import AutoModelForImageTextToText, AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-BASE         = os.environ.get("BASE_REPO", "lancejames221b/HAWQ")
+BASE         = os.environ.get("BASE_REPO", "lancejames221b/HAWQ-v1")
 ADAPTER_DIR  = os.environ.get("ADAPTER_DIR", "/content/adapter")
-ADAPTER_REPO = os.environ.get("ADAPTER_REPO", "lancejames221b/HAWQ-SEC-re-validation-lora")
+ADAPTER_REPO = os.environ.get("ADAPTER_REPO", "lancejames221b/HAWQ-SEC-lora")
 MERGED_DIR   = os.environ.get("MERGED_DIR", "/content/merged")
-MERGED_REPO  = os.environ.get("MERGED_REPO", "lancejames221b/HAWQ-RE")
+MERGED_REPO  = os.environ.get("MERGED_REPO", "lancejames221b/HAWQ-SEC")
 TOKEN        = os.environ.get("HF_TOKEN")
 
 MODEL_CARD = f"""---
@@ -41,26 +41,28 @@ tags:
 - offensive-security
 language:
 - en
-pipeline_tag: image-text-to-text
+pipeline_tag: text-generation
 library_name: transformers
 ---
 
-# HAWQ-RE
+# HAWQ-SEC
 
-HAWQ-RE is a **LoRA SFT** fine-tune of the **HAWQ** base
+HAWQ-SEC is a **LoRA SFT** fine-tune of the **HAWQ-v1** base
 ({BASE}), a Holo3+Qwopus+AgentWorld merge on Qwen3.6-35B-A3B (hybrid
-linear-attention/SSM MoE architecture, 256 experts, vision tower intact).
-The LoRA adapter is trained on reverse-engineering (decompile-bench) and
-anti-loop recovery data, then merged back into the base.
+linear-attention/SSM MoE architecture, 256 experts, text-only CausalLM).
+The LoRA adapter is trained on a full 8-family SFT mix (decompile/RE,
+crypto_id, ransomware-crypto, math, cyber, loop_recovery, mythos, uncensor),
+then merged back into the base.
 
 ## Training
 
-- Base: `{BASE}` (Holo3+Qwopus+AgentWorld merge on Qwen3.6-35B-A3B)
+- Base: `{BASE}` (Holo3+Qwopus+AgentWorld merge on Qwen3.6-35B-A3B, text-only CausalLM)
 - Method: LoRA SFT via `transformers` + `peft`, response-only prompt-prefix
   masking (no TRL, avoiding a v5-transformers compatibility risk)
-- Data: `lancejames221b/HAWQ-SEC-re-validation` - RE foundation (decompile-bench)
-  and anti-doom-loop traces
-- MAX_STEPS=500, `MAXLEN=3072`, LoRA rank/alpha per `adapter_config.json`
+- Data: `lancejames221b/hawq-sec-sft` - 8-family mix (decompile/RE, crypto_id,
+  ransomware-crypto, math, cyber, loop_recovery, mythos, uncensor)
+- 2 epochs (`MAX_STEPS=-1`), `MAXLEN=3072`, LoRA rank/alpha per `adapter_config.json`,
+  best-eval-loss checkpoint (early-stopping patience 3)
 
 ## License
 
@@ -70,6 +72,8 @@ Released under **Apache 2.0**, matching the {BASE} base model.
 
 def load_base():
     kw = dict(dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map="cpu")
+    if os.environ.get("FORCE_CAUSAL_LM", "0") == "1":
+        return AutoModelForCausalLM.from_pretrained(BASE, **kw)
     try:
         return AutoModelForImageTextToText.from_pretrained(BASE, **kw)
     except Exception as e:

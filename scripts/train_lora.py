@@ -23,7 +23,7 @@ import os, torch, glob
 from transformers import (AutoModelForImageTextToText, AutoModelForCausalLM,
                           AutoTokenizer,
                           Trainer, TrainingArguments, DataCollatorForSeq2Seq,
-                          TrainerCallback)
+                          TrainerCallback, EarlyStoppingCallback)
 from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
 from huggingface_hub import upload_folder
@@ -58,11 +58,14 @@ ds = ds.filter(lambda r: r["input_ids"] is not None)
 # (confirmed empirically earlier); CausalLM as fallback only if that class
 # genuinely can't resolve the checkpoint.
 _load_kw = dict(device_map={"": 0}, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
-try:
-    model = AutoModelForImageTextToText.from_pretrained(BASE, **_load_kw)
-except Exception as e:
-    print(f"[load] ImageTextToText failed ({type(e).__name__}); trying CausalLM")
+if os.environ.get("FORCE_CAUSAL_LM", "0") == "1":
     model = AutoModelForCausalLM.from_pretrained(BASE, **_load_kw)
+else:
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(BASE, **_load_kw)
+    except Exception as e:
+        print(f"[load] ImageTextToText failed ({type(e).__name__}); trying CausalLM")
+        model = AutoModelForCausalLM.from_pretrained(BASE, **_load_kw)
 model.config.use_cache = False
 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 model.enable_input_require_grads()
@@ -114,7 +117,8 @@ args = TrainingArguments(
     # The built-in push_to_hub=True uses async Futures that silently swallow
     # errors (huggingface/transformers#29399 + Future exception swallowing).
     # We disable it and use our own callback that does blocking uploads.
-    push_to_hub=False, prediction_loss_only=True)
+    push_to_hub=False, prediction_loss_only=True,
+    load_best_model_at_end=True, metric_for_best_model="eval_loss", greater_is_better=False)
 
 
 class HubCheckpointPusher(TrainerCallback):
@@ -130,7 +134,7 @@ class HubCheckpointPusher(TrainerCallback):
         latest = ckpts[-1]
         name = os.path.basename(latest)
         try:
-            create_repo(ADAPTER_REPO, token=HF_TOKEN, exist_ok=True, private=False)
+            create_repo(ADAPTER_REPO, token=HF_TOKEN, exist_ok=True, private=True)
             upload_folder(
                 repo_id=ADAPTER_REPO,
                 folder_path=latest,
@@ -146,7 +150,7 @@ class HubCheckpointPusher(TrainerCallback):
 trainer = Trainer(model=model, args=args,
     train_dataset=ds["train"], eval_dataset=ds["validation"],
     data_collator=DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True),
-    callbacks=[HubCheckpointPusher()])
+    callbacks=[HubCheckpointPusher(), EarlyStoppingCallback(early_stopping_patience=3)])
 
 resume_path = None
 if os.environ.get("RESUME"):
@@ -172,7 +176,7 @@ trainer.train(resume_from_checkpoint=resume_path)
 
 model.save_pretrained(OUT)
 tok.save_pretrained(OUT)
-model.push_to_hub(ADAPTER_REPO, private=False, token=HF_TOKEN)
-tok.push_to_hub(ADAPTER_REPO, private=False, token=HF_TOKEN)
+model.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
+tok.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
 
 print("TRAINING_COMPLETE")
