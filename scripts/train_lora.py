@@ -65,6 +65,14 @@ _QLORA_4BIT = os.environ.get("QLORA_4BIT", "0") == "1"
 # QLORA_4BIT=0 on a multi-GPU host (e.g. 2x A100-40GB) to shard plain bf16
 # load across GPUs instead of quantizing on a single card.
 _device_map = os.environ.get("DEVICE_MAP", "").strip() or {"": 0}
+# MAX_MEMORY_GIB caps how much of each GPU's weights budget device_map="auto"
+# uses, leaving headroom for activations/gradients during backward (naive
+# model-parallel splits by weight size only, ignoring activation memory -
+# confirmed OOM in backward without this on 2x 40GB A100s).
+_max_mem_gib = os.environ.get("MAX_MEMORY_GIB", "").strip()
+_max_memory = None
+if _max_mem_gib and _device_map == "auto":
+    _max_memory = {i: f"{_max_mem_gib}GiB" for i in range(torch.cuda.device_count())}
 if _QLORA_4BIT:
     from transformers import BitsAndBytesConfig
     from peft import prepare_model_for_kbit_training
@@ -72,8 +80,12 @@ if _QLORA_4BIT:
         load_in_4bit=True, bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
     _load_kw = dict(device_map=_device_map, quantization_config=_bnb_cfg, low_cpu_mem_usage=True)
+    if _max_memory:
+        _load_kw["max_memory"] = _max_memory
 else:
     _load_kw = dict(device_map=_device_map, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    if _max_memory:
+        _load_kw["max_memory"] = _max_memory
 if os.environ.get("FORCE_CAUSAL_LM", "0") == "1":
     model = AutoModelForCausalLM.from_pretrained(BASE, **_load_kw)
 else:
