@@ -57,7 +57,16 @@ ds = ds.filter(lambda r: r["input_ids"] is not None)
 # the correct class for this *ForConditionalGeneration multimodal MoE arch
 # (confirmed empirically earlier); CausalLM as fallback only if that class
 # genuinely can't resolve the checkpoint.
-_load_kw = dict(device_map={"": 0}, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+_QLORA_4BIT = os.environ.get("QLORA_4BIT", "0") == "1"
+if _QLORA_4BIT:
+    from transformers import BitsAndBytesConfig
+    from peft import prepare_model_for_kbit_training
+    _bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
+    _load_kw = dict(device_map={"": 0}, quantization_config=_bnb_cfg, low_cpu_mem_usage=True)
+else:
+    _load_kw = dict(device_map={"": 0}, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
 if os.environ.get("FORCE_CAUSAL_LM", "0") == "1":
     model = AutoModelForCausalLM.from_pretrained(BASE, **_load_kw)
 else:
@@ -66,6 +75,8 @@ else:
     except Exception as e:
         print(f"[load] ImageTextToText failed ({type(e).__name__}); trying CausalLM")
         model = AutoModelForCausalLM.from_pretrained(BASE, **_load_kw)
+if _QLORA_4BIT:
+    model = prepare_model_for_kbit_training(model)
 model.config.use_cache = False
 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 model.enable_input_require_grads()
