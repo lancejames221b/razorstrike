@@ -257,16 +257,35 @@ def split_reasoning(full_text):
 
 
 def parse_tool_calls(text):
-    """Parse native Qwen tool-call blocks from generated text.
+    """Parse tool-call blocks from generated text.
 
-    Matches the tool-call wrapper tokens (TC_OPEN ... TC_CLOSE, built from
-    chr() at module load) wrapping a JSON object with name+arguments. Falls
-    back to bare JSON objects containing both "name" and "arguments" keys if
-    no wrapped blocks are found. Returns a list of
-    {"name":..., "arguments": <dict>}, skipping anything that fails to
-    json.loads or lacks "name".
+    HAWQ's chat_template.jinja instructs native XML-attribute function calls:
+    <tool_call><function=NAME><parameter=PNAME>value</parameter>...</function>
+    </tool_call> (verified against the model's actual output - it complies
+    with its own template exactly). Tried first. Falls back to a JSON object
+    wrapped in TC_OPEN/TC_CLOSE (older Qwen convention), then to bare JSON
+    objects containing both "name" and "arguments" keys, for compatibility
+    with other base models. Returns a list of {"name":..., "arguments": <dict>},
+    skipping anything that fails to parse or lacks "name".
     """
     calls = []
+    # --- Primary: XML-attribute function-call format (HAWQ's actual format) ---
+    tc_pat = re.escape(TC_OPEN) + r"\s*(.*?)\s*" + re.escape(TC_CLOSE)
+    func_pat = r"<function=([^>]+)>\s*(.*?)\s*</function>"
+    param_pat = r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>"
+    for tc_m in re.finditer(tc_pat, text, re.DOTALL):
+        block = tc_m.group(1)
+        func_m = re.search(func_pat, block, re.DOTALL)
+        if not func_m:
+            continue
+        name = func_m.group(1).strip()
+        args = {}
+        for p_m in re.finditer(param_pat, func_m.group(2), re.DOTALL):
+            args[p_m.group(1).strip()] = p_m.group(2)
+        calls.append({"name": name, "arguments": args})
+    if calls:
+        return calls
+    # --- Fallback: JSON object wrapped in TC_OPEN/TC_CLOSE ---
     pat = re.escape(TC_OPEN) + r"\s*(\{.*?\})\s*" + re.escape(TC_CLOSE)
     for m in re.finditer(pat, text, re.DOTALL):
         try:
