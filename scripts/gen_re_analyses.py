@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--out", default="gen_results.json")
     ap.add_argument("--max-new-tokens", type=int, default=1800)
     ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--n-tasks", type=int, default=0, help="limit to first N tasks (0 = all)")
     args = ap.parse_args()
 
     tasks = []
@@ -56,6 +57,8 @@ def main():
             line = line.strip()
             if line:
                 tasks.append(json.loads(line))
+    if args.n_tasks:
+        tasks = tasks[:args.n_tasks]
     print(f"[gen] {len(tasks)} held-out tasks", flush=True)
 
     import torch
@@ -89,8 +92,9 @@ def main():
 
     BATCH = args.batch_size
 
-    def generate_all(items, key_fn):
-        """items: list of dicts with 'asm'; returns list of generated strings in order."""
+    def generate_all(items, key_fn, partial_key, ckpt_path):
+        """items: list of dicts with 'asm'; returns list of generated strings in order.
+        Writes ckpt_path after every batch (durability against spot preemption)."""
         out_texts = [None] * len(items)
         for start in range(0, len(items), BATCH):
             chunk = items[start:start + BATCH]
@@ -100,13 +104,18 @@ def main():
                 out_texts[start + j] = txt
             done = min(start + BATCH, len(items))
             print(f"[gen] {key_fn} {done}/{len(items)}", flush=True)
+            with open(ckpt_path, "w") as f:
+                json.dump({"key": partial_key, "done": done, "texts": out_texts}, f)
         return out_texts
 
-    results = []
+    results = [{"asm": t["asm"], "code": t["code"]} for t in tasks]
     print("[gen] generating BASE analyses", flush=True)
-    base_texts = generate_all(tasks, "base")
-    for t, base_text in zip(tasks, base_texts):
-        results.append({"asm": t["asm"], "code": t["code"], "base_analysis": base_text})
+    base_texts = generate_all(tasks, "base", "base", args.out + ".base_ckpt.json")
+    for r, base_text in zip(results, base_texts):
+        r["base_analysis"] = base_text
+    with open(args.out, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[gen] base pass complete, checkpoint written -> {args.out}", flush=True)
 
     del model
     import gc
@@ -121,10 +130,9 @@ def main():
     model = tuned
 
     print("[gen] generating TUNED analyses", flush=True)
-    tuned_texts = generate_all(results, "tuned")
+    tuned_texts = generate_all(results, "tuned", "tuned", args.out + ".tuned_ckpt.json")
     for r, tuned_text in zip(results, tuned_texts):
         r["tuned_analysis"] = tuned_text
-
 
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
