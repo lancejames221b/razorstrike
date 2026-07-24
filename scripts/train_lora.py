@@ -58,15 +58,22 @@ ds = ds.filter(lambda r: r["input_ids"] is not None)
 # (confirmed empirically earlier); CausalLM as fallback only if that class
 # genuinely can't resolve the checkpoint.
 _QLORA_4BIT = os.environ.get("QLORA_4BIT", "0") == "1"
+# DEVICE_MAP override: fallback path when on-the-fly bnb 4-bit quantization
+# OOMs during load (confirmed failure mode on this MoE arch - the expert
+# weight-merge conversion materializes at full bf16 precision on GPU before
+# quantizing, transformers#43032-class bug). Set DEVICE_MAP=auto with
+# QLORA_4BIT=0 on a multi-GPU host (e.g. 2x A100-40GB) to shard plain bf16
+# load across GPUs instead of quantizing on a single card.
+_device_map = os.environ.get("DEVICE_MAP", "").strip() or {"": 0}
 if _QLORA_4BIT:
     from transformers import BitsAndBytesConfig
     from peft import prepare_model_for_kbit_training
     _bnb_cfg = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
-    _load_kw = dict(device_map={"": 0}, quantization_config=_bnb_cfg, low_cpu_mem_usage=True)
+    _load_kw = dict(device_map=_device_map, quantization_config=_bnb_cfg, low_cpu_mem_usage=True)
 else:
-    _load_kw = dict(device_map={"": 0}, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    _load_kw = dict(device_map=_device_map, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
 if os.environ.get("FORCE_CAUSAL_LM", "0") == "1":
     model = AutoModelForCausalLM.from_pretrained(BASE, **_load_kw)
 else:
