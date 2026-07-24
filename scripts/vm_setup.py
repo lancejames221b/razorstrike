@@ -58,6 +58,8 @@ def main():
         "torchao>=0.16.0",       # stock image ships 0.10.0; transformers requires >=0.16.0
         "flash-linear-attention",  # ~2x speedup on the 30/40 linear-attention/SSM layers
         "bitsandbytes>=0.43",      # QLoRA 4-bit load path (QLORA_4BIT=1)
+        "jinja2>=3.1.0",           # apply_chat_template requires >=3.1.0;
+                                    # some DL image bases ship 3.0.3
     ]
     rc, out, err = run(f"pip -q install -U {' '.join(repr(d) if ' ' in d else d for d in deps)}", timeout=300)
     print(f"[setup] deps installed (rc={rc})")
