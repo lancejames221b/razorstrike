@@ -164,8 +164,44 @@ if _missing:
           f"meaningless. Sample missing: {list(_missing)[:5]}", flush=True)
     sys.exit(2)
 
+def _patch_adapter_dir(src_dir):
+    """The adapter was trained against a base whose module tree has a
+    `language_model.` segment (the ConditionalGeneration/multimodal wrapper
+    convention: `model.language_model.layers.*`). Our extracted text-only
+    CausalLM checkpoint strips that segment (`model.layers.*`, see Step 2),
+    so 100% of the adapter's saved LoRA keys (confirmed: 380/380) fail to
+    match any module and silently no-op during merge - `merge_and_unload()`
+    does not raise, it just emits a UserWarning and returns the base
+    unmodified. Fix: copy the checkpoint dir, rewrite every safetensors key
+    to drop the `.language_model.` segment, point PeftModel at the copy."""
+    import shutil, tempfile
+    from safetensors.torch import safe_open, save_file
+    dst_dir = tempfile.mkdtemp(prefix="adapter_patched_")
+    for fname in os.listdir(src_dir):
+        if fname != "adapter_model.safetensors":
+            shutil.copy(os.path.join(src_dir, fname), os.path.join(dst_dir, fname))
+    src_path = os.path.join(src_dir, "adapter_model.safetensors")
+    tensors = {}
+    with safe_open(src_path, framework="pt") as f:
+        for k in f.keys():
+            tensors[k.replace(".language_model.", ".")] = f.get_tensor(k)
+    save_file(tensors, os.path.join(dst_dir, "adapter_model.safetensors"))
+    return dst_dir
+
+
 if not no_adapter:
-    model = PeftModel.from_pretrained(model, adapter_dir)
+    import warnings as _warnings
+    patched_dir = _patch_adapter_dir(adapter_dir)
+    with _warnings.catch_warnings(record=True) as _caught:
+        _warnings.simplefilter("always")
+        model = PeftModel.from_pretrained(model, patched_dir)
+    _missing_warnings = [str(w.message) for w in _caught
+                          if "missing adapter keys" in str(w.message).lower()]
+    if _missing_warnings:
+        print(f"[eval] FATAL: adapter keys still missing after "
+              f"language_model. patch: {_missing_warnings[0][:500]}", flush=True)
+        sys.exit(3)
+    print(f"[eval] adapter loaded clean: 0 missing-key warnings after patch", flush=True)
     model = model.merge_and_unload()
 model.eval()
 print(f"[eval] model loaded{'+ merged' if not no_adapter else ''}, "
