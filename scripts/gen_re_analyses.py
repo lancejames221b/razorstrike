@@ -46,7 +46,7 @@ def main():
     ap.add_argument("--base-repo", default="lancejames221b/HAWQ-v1")
     ap.add_argument("--adapter-dir", default="/content/adapter")
     ap.add_argument("--out", default="gen_results.json")
-    ap.add_argument("--max-new-tokens", type=int, default=900)
+    ap.add_argument("--max-new-tokens", type=int, default=1800)
     args = ap.parse_args()
 
     tasks = []
