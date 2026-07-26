@@ -19,7 +19,7 @@ Reads env: BASE_REPO (default Qwen/Qwen3.6-35B-A3B), DATA_REPO, OUT_DIR,
   LORA_ALPHA(64), SAVE_STEPS(50), EVAL_STEPS(250), RESUME.
 """
 
-import os, torch, glob, subprocess
+import os, gc, torch, glob, subprocess
 from transformers import (AutoModelForImageTextToText, AutoModelForCausalLM,
                           AutoTokenizer,
                           Trainer, TrainingArguments, DataCollatorForSeq2Seq,
@@ -401,10 +401,26 @@ if torch.cuda.is_available():
 # reports, confirmed against this exact plan. So it runs on ALL ranks here,
 # unconditionally. SHARDED_STATE_DICT (used during training for cheap
 # periodic checkpoints) only loads back into FSDP; the final adapter must
-# be gathered as FULL_STATE_DICT so it's a normal loadable PEFT directory -
-# cheap here since only 65M LoRA params need to be trainable-only gathered
-# (base weights still gather too, but this happens once, not per-checkpoint).
+# be gathered as FULL_STATE_DICT so it's a normal loadable PEFT directory.
+# NOTE: accelerator.get_state_dict() gathers the WHOLE wrapped model (all
+# 34.66B base+adapter params get FSDP-unsharded onto rank 0), not just the
+# 65M trainable LoRA params - PEFT only filters down to adapter weights
+# after the gather when Trainer._save() writes the file. This is expensive
+# in both time (~12 saves if done every checkpoint - hence SHARDED_STATE_DICT
+# for periodic saves, FULL only here at the very end) and peak memory, so
+# free everything gather-adjacent first: optimizer states, autograd graph
+# residue, and the CUDA caching allocator's fragmented pool. Verified
+# necessary - without this, the final gather hit an NCCL "unhandled cuda
+# error" under the tight 4-GPU fallback shape at ~40/41GB already in use.
 if _FSDP:
+    # zero_grad(set_to_none=True) actually frees gradient tensors (the
+    # live-memory term); del'ing trainer.optimizer barely helps since
+    # accelerate keeps its own reference to the wrapped optimizer -
+    # empty_cache() is what matters, returning the caching allocator's
+    # fragmented reserve so NCCL's all-gather buffer has room to allocate.
+    trainer.model.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.cuda.empty_cache()
     trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     trainer.save_model(OUT)      # FSDP-aware state-dict gather, all ranks
 
