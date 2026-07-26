@@ -448,7 +448,10 @@ if os.environ.get("RESUME"):
                 subprocess.run(["gcloud", "storage", "rsync", "-r", latest, resume_path], check=True)
                 print(f"[resume] pulled {name} from GCS -> {resume_path}")
             else:
-                print("[resume] no GCS checkpoint dirs found; starting fresh")
+                if ckpt_dirs:
+                    print(f"[resume] all {len(ckpt_dirs)} GCS checkpoint(s) failed verification; starting fresh")
+                else:
+                    print("[resume] no GCS checkpoint dirs found; starting fresh")
         except Exception as e:
             print(f"[resume] no GCS checkpoint found ({type(e).__name__}: {e}); starting fresh")
     else:
