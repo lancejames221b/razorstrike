@@ -112,24 +112,40 @@ case "$cmd" in
         --zone="$ZONE" --project="$PROJECT" "${_scp_iap_flag[@]}"
     fi
 
-    # Pre-download the base model ONCE before torchrun spins up N ranks.
-    # Without this, from_pretrained's hf_hub download-lock serializes the
-    # ~70GB checkpoint fetch across all N processes - N-1 GPUs idle through
-    # the whole download instead of it happening once, in parallel with
-    # nothing else waiting on it. HF_HOME pinned onto the (400GB) boot disk,
-    # not the default ~/.cache, so it doesn't compete with OS/swap space.
-    echo "[gce] pre-downloading base model (avoids N-way serialized download under torchrun)"
-    _ssh "cd /content/razorstrike && HF_HOME=/content/hf_home HF_TOKEN='$HF_TOKEN' python3 -u -c \"
+    # Base model staging: prefer a GCS-staged copy (in-region rsync runs at
+    # GB/s vs ~70min pulling ~70GB from HF Hub) and fall back to HF only if
+    # none is staged. Either way, this happens ONCE before torchrun spins
+    # up N ranks - N-1 GPUs would otherwise idle through hf_hub's download
+    # lock serializing the fetch across all N processes.
+    BASE_MODEL_GCS="${BASE_MODEL_GCS:-gs://hawq-training-us-central1/models/HAWQ-v1}"
+    echo "[gce] staging base model (GCS-staged preferred: $BASE_MODEL_GCS)"
+    _stage_out="$(_ssh "cd /content/razorstrike && _gcs_ok=0
+if gcloud storage ls '$BASE_MODEL_GCS' >/dev/null 2>&1; then
+  mkdir -p /content/base_model
+  gcloud storage rsync -r --no-ignore-symlinks '$BASE_MODEL_GCS' /content/base_model && _gcs_ok=1
+fi
+if [ \"\$_gcs_ok\" = 1 ]; then
+  echo 'BASE_MODEL_SOURCE=gcs:/content/base_model'
+else
+  HF_HOME=/content/hf_home HF_TOKEN='$HF_TOKEN' python3 -u -c \"
 from huggingface_hub import snapshot_download
 p = snapshot_download(repo_id='lancejames221b/HAWQ-v1', token='$HF_TOKEN')
-print('cached at', p)
-\""
+print('BASE_MODEL_SOURCE=hf:' + p)
+\"
+fi")"
+    echo "$_stage_out" | tail -20
+    _base_repo_resolved="$(echo "$_stage_out" | grep -oE 'BASE_MODEL_SOURCE=(gcs|hf):.*' | tail -1 | sed -E 's/BASE_MODEL_SOURCE=(gcs|hf)://')"
+    if [ -z "$_base_repo_resolved" ]; then
+      echo "[gce] ERROR: could not resolve base model source (GCS stage and HF download both failed)" >&2
+      exit 1
+    fi
+    echo "[gce] base model resolved -> $_base_repo_resolved"
 
     echo "[gce] launching torchrun (nproc_per_node=$GPU_COUNT, GRAD_ACCUM=$GRAD_ACCUM)"
     launch_cmd="cd /content/razorstrike && pkill -f train_lora 2>/dev/null; sleep 2; \
 HF_HOME=/content/hf_home \
 HF_TOKEN='$HF_TOKEN' \
-BASE_REPO=lancejames221b/HAWQ-v1 \
+BASE_REPO='$_base_repo_resolved' \
 DATA_REPO='$DATA_REPO' \
 ADAPTER_REPO='$ADAPTER_FULL' \
 OUT_DIR=/content/adapter \
