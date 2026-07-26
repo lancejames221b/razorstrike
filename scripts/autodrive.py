@@ -27,8 +27,8 @@ import sys
 import json
 import os
 
-SESSION = "rs-g4"
-ADAPTER_FULL = "lancejames221b/HAWQ-SEC-lora"
+SESSION = os.environ.get("COLAB_SESSION", "rs-g4")
+ADAPTER_FULL = os.environ.get("ADAPTER_FULL", "lancejames221b/HAWQ-SEC-lora")
 MAX_STUCK_CYCLES = 5
 STATE_FILE = "/Volumes/Scratch/razorstrike-repo/.driver_state/state.json"
 HALT_FILE = "/Volumes/Scratch/razorstrike-repo/.driver_state/HALT.txt"
@@ -117,6 +117,38 @@ if os.path.exists(HALT_FILE):
 HF_TOKEN = get_hf_token()
 print(f"[driver] HF_TOKEN acquired (len={len(HF_TOKEN)})", flush=True)
 
+# Dataset/adapter-capacity knobs, parameterized so this driver can launch any
+# run (v2, v3, ...) rather than hardcoding the v2 dataset/adapter pair. These
+# are read on the MAC side and interpolated into LAUNCH_PY below - `colab
+# exec` does not forward the local shell environment into the remote
+# process, so DATA_REPO/LORA_R/LORA_ALPHA must be baked into the generated
+# script rather than left for the VM's own os.environ.copy() to pick up.
+DATA_REPO = os.environ.get("DATA_REPO", "lancejames221b/hawq-sec-sft")
+LORA_R = os.environ.get("LORA_R", "32")
+LORA_ALPHA = os.environ.get("LORA_ALPHA", "64")
+
+# GCS staging (optional): CKPT_GCS enables GCS checkpoint push/resume in
+# train_lora.py; DATA_REPO starting with gs:// enables the GCS dataset read
+# branch. Either requires a service-account key - read locally on the Mac
+# and base64'd into the VM-side script so the secret never touches this git
+# repo or the training log (write-only, never printed).
+CKPT_GCS = os.environ.get("CKPT_GCS", "").strip()
+GCS_KEY_FILE_LOCAL = os.environ.get("GCS_KEY_FILE_LOCAL", "").strip()
+GCS_PROJECT = os.environ.get("GCS_PROJECT", "ewitness-dev")
+GCS_KEY_B64 = ""
+_gcs_needed = bool(CKPT_GCS) or DATA_REPO.startswith("gs://")
+if _gcs_needed:
+    if not GCS_KEY_FILE_LOCAL or not os.path.exists(GCS_KEY_FILE_LOCAL):
+        raise SystemExit(
+            "[driver] CKPT_GCS or a gs:// DATA_REPO was requested but "
+            "GCS_KEY_FILE_LOCAL is unset or missing - refusing to launch "
+            "training with no GCS auth path for the VM.")
+    import base64
+    with open(GCS_KEY_FILE_LOCAL, "rb") as _f:
+        GCS_KEY_B64 = base64.b64encode(_f.read()).decode()
+    print(f"[driver] GCS key loaded for VM injection (b64 len={len(GCS_KEY_B64)}, "
+          f"content never printed)", flush=True)
+
 LAUNCH_PY = f'''
 import subprocess, os, time
 r0 = subprocess.run("HF_TOKEN='{HF_TOKEN}' python3 -c \\"from huggingface_hub import login; login('{HF_TOKEN}'); print('HF_LOGIN_OK')\\"", shell=True, capture_output=True, text=True)
@@ -130,13 +162,25 @@ else:
     print("SETUP:", r2.stdout)
     subprocess.run("pkill -f train_lora 2>/dev/null", shell=True)
     time.sleep(2)
+    if {bool(GCS_KEY_B64)!r}:
+        import base64 as _b64
+        with open("/content/gcs-key.json", "wb") as _kf:
+            _kf.write(_b64.b64decode("{GCS_KEY_B64}"))
+        print("GCS key written to /content/gcs-key.json (len={len(GCS_KEY_B64)})")
+        _auth = subprocess.run(
+            ["gcloud", "auth", "activate-service-account",
+             "--key-file=/content/gcs-key.json", "--project={GCS_PROJECT}"],
+            capture_output=True, text=True)
+        print("GCS_AUTH:", _auth.returncode, _auth.stderr[-300:])
     env = os.environ.copy()
     env.update({{
         "BASE_REPO": "lancejames221b/HAWQ-v1",
-        "DATA_REPO": "lancejames221b/hawq-sec-sft",
+        "DATA_REPO": "{DATA_REPO}",
         "ADAPTER_REPO": "{ADAPTER_FULL}",
         "OUT_DIR": "/content/adapter",
         "MAXLEN": "3072",
+        "LORA_R": "{LORA_R}",
+        "LORA_ALPHA": "{LORA_ALPHA}",
         "TARGET_MLP": "0",
         "SAVE_STEPS": "250",
         "EVAL_STEPS": "250",
@@ -144,21 +188,35 @@ else:
         "FORCE_CAUSAL_LM": "1",
         "HF_TOKEN": "{HF_TOKEN}",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "CKPT_GCS": "{CKPT_GCS}",
+        "GCS_KEY_FILE": "/content/gcs-key.json",
+        "GCS_PROJECT": "{GCS_PROJECT}",
     }})
-    # Only set RESUME=1 if the adapter repo already has a checkpoint-N/ dir to resume from.
+    # Only set RESUME=1 if a checkpoint already exists to resume from. Check
+    # GCS when CKPT_GCS is set (that's where checkpoints actually land in
+    # that mode); otherwise fall back to the Hub-based check.
     # The HubCheckpointPusher callback pushes checkpoints as checkpoint-N/ dirs at repo root,
     # not as last-checkpoint/ (which the old Trainer hub_strategy=checkpoint never created).
     try:
-        from huggingface_hub import list_repo_files
-        files = list_repo_files("{ADAPTER_FULL}", token="{HF_TOKEN}")
-        ckpt_dirs = [f for f in files if f.startswith("checkpoint-")]
+        if "{CKPT_GCS}":
+            _adapter_name = "{ADAPTER_FULL}".rsplit("/", 1)[-1]
+            _r = subprocess.run(
+                ["gcloud", "storage", "ls", "{CKPT_GCS}".rstrip("/") + "/" + _adapter_name + "/"],
+                capture_output=True, text=True)
+            if _r.returncode != 0:
+                print("GCS_LS_FAILED:", _r.returncode, _r.stderr[-300:])
+            ckpt_dirs = [l for l in _r.stdout.splitlines() if "/checkpoint-" in l]
+        else:
+            from huggingface_hub import list_repo_files
+            files = list_repo_files("{ADAPTER_FULL}", token="{HF_TOKEN}")
+            ckpt_dirs = [f for f in files if f.startswith("checkpoint-")]
         if ckpt_dirs:
             env["RESUME"] = "1"
-            print("RESUME=1 ({{}} checkpoints found on Hub)".format(len(ckpt_dirs)))
+            print("RESUME=1 ({{}} checkpoints found)".format(len(ckpt_dirs)))
         else:
-            print("RESUME not set (no checkpoint dirs on Hub - fresh run)")
+            print("RESUME not set (no checkpoint dirs found - fresh run)")
     except Exception as e:
-        print("RESUME not set (repo check failed: {{}})".format(type(e).__name__))
+        print("RESUME not set (checkpoint check failed: {{}})".format(type(e).__name__))
     cmd = "cd /content/razorstrike && nohup python3 -m scripts.train_lora > /content/train.log 2>&1 &"
     subprocess.Popen(cmd, shell=True, env=env)
     time.sleep(3)

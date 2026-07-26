@@ -19,7 +19,7 @@ Reads env: BASE_REPO (default Qwen/Qwen3.6-35B-A3B), DATA_REPO, OUT_DIR,
   LORA_ALPHA(64), SAVE_STEPS(50), EVAL_STEPS(250), RESUME.
 """
 
-import os, torch, glob
+import os, torch, glob, subprocess
 from transformers import (AutoModelForImageTextToText, AutoModelForCausalLM,
                           AutoTokenizer,
                           Trainer, TrainingArguments, DataCollatorForSeq2Seq,
@@ -29,9 +29,35 @@ from datasets import load_dataset
 from huggingface_hub import upload_folder
 
 BASE   = os.environ.get("BASE_REPO", "Qwen/Qwen3.6-35B-A3B")
-DATA   = os.environ["DATA_REPO"]           # lancejames221b/razorstrike-v2-sft
+DATA   = os.environ["DATA_REPO"]           # lancejames221b/razorstrike-v2-sft OR gs://bucket/path
 OUT    = os.environ.get("OUT_DIR", "/content/adapter")
 MAXLEN = int(os.environ.get("MAXLEN", "3072"))  # 4096 tail (0.2% of rows >4096, 1.1% >3072) OOMs on 96GB G4; verified via row-length sampling
+
+# GCS staging: activate the service-account key (written to disk by the
+# launcher, NEVER committed to this repo) before any `gcloud storage` call.
+# GOOGLE_APPLICATION_CREDENTIALS is a client-library convention the gcloud
+# CLI itself does not honor - explicit activate-service-account is required.
+GCS_KEY_FILE = os.environ.get("GCS_KEY_FILE", "/content/gcs-key.json")
+GCS_PROJECT = os.environ.get("GCS_PROJECT", "ewitness-dev")
+_gcs_activated = False
+# DDP: `gcloud auth activate-service-account` mutates a shared config dir
+# (~/.config/gcloud by default). 8 ranks calling it concurrently race on
+# the same credentials file. Give each rank its own isolated config dir -
+# no cross-process coordination needed, and each rank's own token is fully
+# independent (never shared secret state to corrupt).
+os.environ.setdefault("CLOUDSDK_CONFIG", f"/tmp/gcloud-config-rank{os.environ.get('LOCAL_RANK', '0')}")
+
+
+def _gcs_activate():
+    global _gcs_activated
+    if _gcs_activated:
+        return
+    if not os.path.exists(GCS_KEY_FILE):
+        raise RuntimeError(f"GCS mode requested but key file missing: {GCS_KEY_FILE}")
+    subprocess.run(["gcloud", "auth", "activate-service-account",
+                     f"--key-file={GCS_KEY_FILE}", f"--project={GCS_PROJECT}"], check=True)
+    _gcs_activated = True
+
 
 tok = AutoTokenizer.from_pretrained(BASE)
 if tok.pad_token is None:
@@ -48,7 +74,34 @@ def to_features(ex):
     return {"input_ids": full, "attention_mask": [1] * len(full), "labels": labels}
 
 
-ds = load_dataset(DATA)
+_local_rank = int(os.environ.get("LOCAL_RANK", "0"))  # torchrun sets this per-process; absent -> single-process (rank 0)
+
+if DATA.startswith("gs://"):
+    _local = "/content/dataset"
+    _ready = os.path.join(_local, ".rsync_complete")
+    # DDP: all ranks import this module and reach here independently. Only
+    # rank 0 downloads; concurrent rsyncs into the same dir from 8 ranks
+    # would corrupt/partially-read the Arrow files. Other ranks poll a
+    # sentinel written after rank 0's rsync finishes rather than assuming
+    # any particular startup ordering.
+    if _local_rank == 0:
+        _gcs_activate()
+        subprocess.run(["gcloud", "storage", "rsync", "-r", DATA, _local], check=True)
+        with open(_ready, "w") as _f:
+            _f.write("ok")
+    else:
+        import time as _time
+        _waited = 0
+        while not os.path.exists(_ready):
+            _time.sleep(5)
+            _waited += 5
+            if _waited > 1800:
+                raise RuntimeError(f"rank {_local_rank}: timed out waiting 30min for "
+                                    f"rank 0's dataset download ({_ready} never appeared)")
+    from datasets import load_from_disk
+    ds = load_from_disk(_local)
+else:
+    ds = load_dataset(DATA)
 ds = ds.map(to_features, remove_columns=ds["train"].column_names)
 ds = ds.filter(lambda r: r["input_ids"] is not None)
 
@@ -64,7 +117,13 @@ _QLORA_4BIT = os.environ.get("QLORA_4BIT", "0") == "1"
 # quantizing, transformers#43032-class bug). Set DEVICE_MAP=auto with
 # QLORA_4BIT=0 on a multi-GPU host (e.g. 2x A100-40GB) to shard plain bf16
 # load across GPUs instead of quantizing on a single card.
-_device_map = os.environ.get("DEVICE_MAP", "").strip() or {"": 0}
+# DDP: torchrun sets LOCAL_RANK per-process. Each rank MUST load its own
+# quantized replica onto its OWN GPU ({"": local_rank}) - device_map="auto"
+# under DDP causes ranks to independently naive-shard the model across ALL
+# visible GPUs, silently colliding/deadlocking instead of each rank owning
+# one full replica. LOCAL_RANK is absent for a single-process launch, so
+# this is a no-op there (falls back to GPU 0 exactly as before).
+_device_map = os.environ.get("DEVICE_MAP", "").strip() or {"": _local_rank}
 # MAX_MEMORY_GIB caps how much of each GPU's weights budget device_map="auto"
 # uses, leaving headroom for activations/gradients during backward (naive
 # model-parallel splits by weight size only, ignoring activation memory -
@@ -135,7 +194,13 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 args = TrainingArguments(
     output_dir=OUT, num_train_epochs=2,
     max_steps=int(os.environ.get("MAX_STEPS", "-1")),  # -1 = full 2 epochs; positive caps for validation runs
-    per_device_train_batch_size=1, per_device_eval_batch_size=1, gradient_accumulation_steps=16,
+    per_device_train_batch_size=1, per_device_eval_batch_size=1,
+    # DDP: global effective batch = per_device(1) * grad_accum * WORLD_SIZE.
+    # Divide GRAD_ACCUM by the GPU count when launching under torchrun so
+    # the effective batch (and thus the tuned LR/schedule) stays identical
+    # to the single-GPU config - more GPUs should cut wall-clock, not
+    # silently change what's being trained.
+    gradient_accumulation_steps=int(os.environ.get("GRAD_ACCUM", "16")),
     learning_rate=2e-4, lr_scheduler_type="cosine", warmup_ratio=0.03,
     bf16=True, gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -177,36 +242,111 @@ class HubCheckpointPusher(TrainerCallback):
             print(f"[push] {name} FAIL {type(e).__name__}: {e}", flush=True)
 
 
+ADAPTER_NAME = ADAPTER_REPO.rsplit("/", 1)[-1]
+CKPT_GCS = os.environ.get("CKPT_GCS", "").strip()  # e.g. gs://hawq-training-us-central1/checkpoints
+
+
+class GcsCheckpointPusher(TrainerCallback):
+    """Blocking rsync of each checkpoint to GCS after every save. Sibling to
+    HubCheckpointPusher, selected via CKPT_GCS instead of the Hub push so a
+    failed GCS upload never kills training (caught, printed, not re-raised -
+    mirrors HubCheckpointPusher's behavior exactly)."""
+    def on_save(self, args, state, control, **kwargs):
+        ckpts = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")),
+                       key=lambda p: int(p.split("-")[-1]))
+        if not ckpts:
+            return
+        latest = ckpts[-1]
+        name = os.path.basename(latest)
+        dest = f"{CKPT_GCS.rstrip('/')}/{ADAPTER_NAME}/{name}"
+        try:
+            _gcs_activate()
+            subprocess.run(["gcloud", "storage", "rsync", "-r", latest, dest], check=True)
+            print(f"[push] {name} -> {dest} OK", flush=True)
+        except Exception as e:
+            print(f"[push] {name} FAIL {type(e).__name__}: {e}", flush=True)
+
+
 trainer = Trainer(model=model, args=args,
     train_dataset=ds["train"], eval_dataset=ds["validation"],
     data_collator=DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True),
-    callbacks=[HubCheckpointPusher(), EarlyStoppingCallback(early_stopping_patience=3)])
+    callbacks=[GcsCheckpointPusher() if CKPT_GCS else HubCheckpointPusher(),
+               EarlyStoppingCallback(early_stopping_patience=3)])
 
 resume_path = None
 if os.environ.get("RESUME"):
-    # With hub_strategy="all", checkpoints push to the Hub repo root as
-    # checkpoint-N/ dirs. Pull the highest-numbered one and resume from it.
-    from huggingface_hub import list_repo_files, snapshot_download
-    try:
-        files = list_repo_files(ADAPTER_REPO, token=HF_TOKEN)
-        ckpt_dirs = sorted({f.split("/")[0] for f in files if f.startswith("checkpoint-")},
-                            key=lambda s: int(s.split("-")[1]))
-        if ckpt_dirs:
-            latest = ckpt_dirs[-1]
-            snapshot_download(ADAPTER_REPO, allow_patterns=[f"{latest}/*"],
-                               token=HF_TOKEN, local_dir=OUT)
-            resume_path = os.path.join(OUT, latest)
-            print(f"[resume] pulled {latest} from hub -> {resume_path}")
-        else:
-            print("[resume] no checkpoint dirs on hub; starting fresh")
-    except Exception as e:
-        print(f"[resume] no hub checkpoint found ({type(e).__name__}: {e}); starting fresh")
+    if CKPT_GCS:
+        # List gs://.../checkpoints/<ADAPTER_NAME>/checkpoint-*, pick the
+        # highest integer suffix, rsync it down, resume from it.
+        try:
+            _gcs_activate()
+            prefix = f"{CKPT_GCS.rstrip('/')}/{ADAPTER_NAME}/"
+            r = subprocess.run(["gcloud", "storage", "ls", prefix],
+                               check=True, capture_output=True, text=True)
+            ckpt_dirs = sorted(
+                {line.strip().rstrip("/") for line in r.stdout.splitlines()
+                 if "/checkpoint-" in line},
+                key=lambda s: int(s.rsplit("-", 1)[-1]))
+            if ckpt_dirs:
+                latest = ckpt_dirs[-1]
+                name = latest.rsplit("/", 1)[-1]
+                resume_path = os.path.join(OUT, name)
+                subprocess.run(["gcloud", "storage", "rsync", "-r", latest, resume_path], check=True)
+                print(f"[resume] pulled {name} from GCS -> {resume_path}")
+            else:
+                print("[resume] no GCS checkpoint dirs found; starting fresh")
+        except Exception as e:
+            print(f"[resume] no GCS checkpoint found ({type(e).__name__}: {e}); starting fresh")
+    else:
+        # With hub_strategy="all", checkpoints push to the Hub repo root as
+        # checkpoint-N/ dirs. Pull the highest-numbered one and resume from it.
+        from huggingface_hub import list_repo_files, snapshot_download
+        try:
+            files = list_repo_files(ADAPTER_REPO, token=HF_TOKEN)
+            ckpt_dirs = sorted({f.split("/")[0] for f in files if f.startswith("checkpoint-")},
+                                key=lambda s: int(s.split("-")[1]))
+            if ckpt_dirs:
+                latest = ckpt_dirs[-1]
+                snapshot_download(ADAPTER_REPO, allow_patterns=[f"{latest}/*"],
+                                   token=HF_TOKEN, local_dir=OUT)
+                resume_path = os.path.join(OUT, latest)
+                print(f"[resume] pulled {latest} from hub -> {resume_path}")
+            else:
+                print("[resume] no checkpoint dirs on hub; starting fresh")
+        except Exception as e:
+            print(f"[resume] no hub checkpoint found ({type(e).__name__}: {e}); starting fresh")
 
 trainer.train(resume_from_checkpoint=resume_path)
 
-model.save_pretrained(OUT)
-tok.save_pretrained(OUT)
-model.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
-tok.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
+# DDP: every rank reaches this point after trainer.train() returns. Only
+# rank 0 should write/push the final adapter - model.save_pretrained() and
+# push_to_hub() called directly (not via Trainer's own internal methods)
+# are NOT auto-gated by rank, unlike Trainer's own checkpoint saving.
+# Every process racing to write the same OUT dir / push concurrently would
+# corrupt the upload. Non-zero ranks skip straight to TRAINING_COMPLETE.
+if trainer.is_world_process_zero():
+    model.save_pretrained(OUT)
+    tok.save_pretrained(OUT)
+
+    if CKPT_GCS:
+        # Durability first: land the final adapter in GCS before attempting the
+        # HF push, so a private-storage quota failure (the exact failure mode
+        # that has bitten this project before) doesn't strand a completed run.
+        try:
+            _gcs_activate()
+            final_dest = f"{CKPT_GCS.rstrip('/')}/{ADAPTER_NAME}/final"
+            subprocess.run(["gcloud", "storage", "rsync", "-r", OUT, final_dest], check=True)
+            print(f"[push] final adapter -> {final_dest} OK", flush=True)
+        except Exception as e:
+            print(f"[push] final adapter GCS push FAILED {type(e).__name__}: {e}", flush=True)
+        try:
+            model.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
+            tok.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
+        except Exception as e:
+            print(f"[push] final adapter HF push FAILED (non-fatal, GCS copy is durable) "
+                  f"{type(e).__name__}: {e}", flush=True)
+    else:
+        model.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
+        tok.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
 
 print("TRAINING_COMPLETE")

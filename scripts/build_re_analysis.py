@@ -35,7 +35,7 @@ MAX_ASM = 6000       # x86-64 assembly length (chars)
 MAX_CODE = 4000       # C/C++ source length (chars)
 SEED = 42
 N_TASKS = int(os.environ.get("N_TASKS", "1500"))
-N_EVAL = 100
+N_EVAL = int(os.environ.get("N_EVAL", "100"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "1"))
 RETRIES = 2
 
@@ -46,14 +46,28 @@ RE_ANALYST_SYSTEM = (
 )
 
 FRONTIER_SYSTEM = (
-    "You are an elite reverse engineer and educator. You are given x86-64 "
-    "assembly AND the known-correct C/C++ source it compiles from. Using the "
-    "source as ground truth, write a precise technical ANALYSIS of the "
-    "function: (1) one-line purpose, (2) inputs/outputs and types, (3) the "
-    "algorithm/control-flow in prose, (4) any security-relevant behavior "
-    "(memory safety, bounds, crypto, parsing, syscalls). Do NOT reproduce the "
-    "C source verbatim; explain it. Be faithful to the provided source; never "
-    "invent behavior not present in it."
+    "You are an elite reverse engineer. You will be shown x86-64 assembly for a "
+    "function, together with the original C/C++ source it was compiled from. The "
+    "source is provided ONLY so your analysis is factually correct - treat it as a "
+    "private answer key. Write a precise technical analysis OF THE ASSEMBLY, exactly "
+    "as an expert would who has ONLY the assembly in front of them and has never seen "
+    "the source.\n"
+    "Hard rules:\n"
+    "- NEVER mention, quote, or allude to the source, the C/C++ code, an 'answer key', "
+    "'ground truth', or the fact that you were given anything beyond the assembly. The "
+    "reader has only the assembly.\n"
+    "- Only assert a specific upstream function name, library, struct field name, or "
+    "enum symbol when it is genuinely determinable from the assembly alone (embedded "
+    "string literals, syscall numbers, well-known magic constants, or an unmistakable "
+    "published algorithm). When an identification would depend on knowledge you could "
+    "get only from the source, describe the behavior structurally instead, or hedge "
+    "with 'appears to' / 'consistent with'.\n"
+    "- Do NOT narrate a step-by-step 'let me verify... correct... correct' trace or any "
+    "chain-of-thought. Output only the finished analysis.\n"
+    "Structure the analysis as: (1) one-line purpose; (2) inputs/outputs and their "
+    "types/registers; (3) the algorithm and control flow in prose; (4) security-relevant "
+    "behavior (memory safety, bounds, integer overflow, crypto, parsing, syscalls). Be "
+    "faithful to what the assembly actually does; never invent behavior."
 )
 
 FRONTIER_USER_TMPL = (
@@ -99,17 +113,21 @@ def _frontier_call(base_url, model, api_key, asm, code):
     url = f"{base_url}/chat/completions"
     body = {
         "model": model,
-        "reasoning_effort": "none",  # Ollama Cloud reasoning models otherwise
-                                      # burn the token budget on a hidden
-                                      # reasoning trace and leave `content`
-                                      # empty/truncated; this forces the
-                                      # final analysis straight into content.
+        # "none" is NOT a valid harmony reasoning_effort value for gpt-oss-class
+        # models on Ollama Cloud - it's silently ignored and the model reasons
+        # at full effort anyway, burning the whole token budget on a hidden
+        # reasoning trace and leaving `content` truncated/empty (confirmed via
+        # direct API probe: reasoning_effort="none" + max_tokens=1800 on a
+        # near-max-size row -> finish_reason="length", content_len=0,
+        # reasoning_len=6416). "low" empirically collapses the reasoning trace
+        # to near-zero and lets `content` get the token budget.
+        "reasoning_effort": os.environ.get("FRONTIER_REASONING_EFFORT", "low"),
         "messages": [
             {"role": "system", "content": FRONTIER_SYSTEM},
             {"role": "user", "content": FRONTIER_USER_TMPL.format(asm=asm, code=code)},
         ],
         "temperature": 0.3,
-        "max_tokens": 1800,
+        "max_tokens": int(os.environ.get("FRONTIER_MAX_TOKENS", "2600")),
     }
     req = urllib.request.Request(
         url, data=json.dumps(body).encode(),
@@ -143,25 +161,48 @@ def format_train_row(asm, analysis):
     }
 
 
-def _load_kept_rows(need):
-    """Download decompile-bench, filter by length, shuffle (SEED), return `need` kept rows."""
+def _load_kept_rows(need, skip=0):
+    """Return `need` length-filtered rows sampled across the WHOLE corpus,
+    after discarding the first `skip` qualifying rows. `skip` lets a second
+    task family draw a provably disjoint slice of the same shuffled stream.
+
+    Deduplicates by asm content across the WHOLE scan (not just the
+    returned slice): decompile-bench has genuine corpus-level duplicate
+    function bodies (common utility functions repeated across projects),
+    confirmed empirically (~0.7% collision rate). Collapsing them into the
+    stream itself - rather than filtering the returned slice after the
+    fact - keeps the skip-based partition's disjointness guarantee exact:
+    two disjoint slices of a globally-deduped stream can never collide,
+    whereas two slices of a stream with duplicates could each independently
+    encounter the same content."""
     print("Downloading decompile-bench...")
     local_dir = "/Volumes/Scratch/ml-workspace/decompile-bench"
     ds_raw = load_dataset("LLM4Binary/decompile-bench", split="train", cache_dir=local_dir)
     print(f"Raw decompile-bench: {len(ds_raw)} rows")
-
-    kept = []
-    for row in ds_raw:
+    ds_shuf = ds_raw.shuffle(seed=SEED)          # full-corpus permutation, not a head slice
+    # Gated (default OFF): a live/resumable run must reproduce the EXACT
+    # same stream on restart as its original launch, or RAW_CACHE entries
+    # (keyed by asm) partially miss and the skip-based cross-family
+    # partition silently shifts mid-run. Flip on explicitly for a fresh
+    # run/rebuild once nothing is depending on stream stability.
+    _dedup = os.environ.get("DEDUP_ASM", "0") == "1"
+    kept, seen = [], 0
+    seen_asms = set()
+    for row in ds_shuf:
         asm, code = row["asm"], row["code"]
         if len(asm) <= MAX_ASM and len(code) <= MAX_CODE:
+            if _dedup:
+                if asm in seen_asms:
+                    continue  # corpus-level duplicate function body - collapse, don't recount
+                seen_asms.add(asm)
+            seen += 1
+            if seen <= skip:
+                continue
             kept.append({"asm": asm, "code": code})
-        if len(kept) >= need * 3:  # enough headroom before shuffle-slice
+        if len(kept) >= need:
             break
-
-    random.seed(SEED)
-    random.shuffle(kept)
     if len(kept) < need:
-        raise RuntimeError(f"only found {len(kept)} kept rows, need {need}")
+        raise RuntimeError(f"only found {len(kept)} kept rows, need {need} (skip={skip})")
     return kept
 
 
@@ -174,11 +215,42 @@ def build_re_analysis_dataset(n_tasks=N_TASKS, n_eval=N_EVAL, eval_out=None):
     eval_src = kept[n_tasks:n_tasks + n_eval]
     print(f"[data] {len(train_src)} train rows, {len(eval_src)} eval rows (disjoint)")
 
+    # Resumable, crash-safe generation cache: keyed by the ASM (the natural
+    # unique key for a src row - same asm the eventual training row stores).
+    # A multi-thousand-call run against a paid frontier API must not lose
+    # already-paid-for work to a crash/timeout partway through, and must not
+    # re-pay for rows a prior partial run already generated.
+    raw_cache = os.environ.get("RAW_CACHE", "/tmp/hawq_re/raw_generations.jsonl")
+    os.makedirs(os.path.dirname(raw_cache), exist_ok=True)
+    cached = {}
+    if os.path.exists(raw_cache):
+        with open(raw_cache) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                cached[row["messages"][1]["content"]] = row
+        print(f"[gen] resumed {len(cached)} already-generated rows from {raw_cache}")
+
+    cache_lock = __import__("threading").Lock()
+    cache_f = open(raw_cache, "a")
+
+    def _user_turn(asm):
+        return format_train_row(asm, "")["messages"][1]["content"]
+
     def gen_one(src_row):
+        key = _user_turn(src_row["asm"])
+        if key in cached:
+            return cached[key]
         analysis = _frontier_call(base_url, model, api_key, src_row["asm"], src_row["code"])
         if not analysis:
             return None
-        return format_train_row(src_row["asm"], analysis)
+        row = format_train_row(src_row["asm"], analysis)
+        with cache_lock:
+            cache_f.write(json.dumps(row) + "\n")
+            cache_f.flush()
+        return row
 
     train_rows = []
     if MAX_WORKERS > 1:
@@ -195,9 +267,12 @@ def build_re_analysis_dataset(n_tasks=N_TASKS, n_eval=N_EVAL, eval_out=None):
                 train_rows.append(r)
             if (i + 1) % 50 == 0:
                 print(f"[gen] {i + 1}/{len(train_src)} processed, {len(train_rows)} kept")
+    cache_f.close()
 
     print(f"[gen] done: {len(train_rows)}/{len(train_src)} rows generated "
           f"({len(train_src) - len(train_rows)} skipped on frontier failure)")
+    print(f"[gen] raw generations cached -> {raw_cache} (survives a guard failure below; "
+          f"a re-run reads this back and only pays for what's still missing)")
 
     random.seed(SEED)
     random.shuffle(train_rows)
@@ -213,6 +288,25 @@ def build_re_analysis_dataset(n_tasks=N_TASKS, n_eval=N_EVAL, eval_out=None):
                 raise ValueError(f"{split_name}[{i}] malformed messages")
             if "```cpp" in row["messages"][1]["content"] or "KNOWN-CORRECT" in row["messages"][1]["content"]:
                 raise ValueError(f"{split_name}[{i}] user turn leaks ground-truth C")
+
+    import re as _re
+    _SRC_REF = _re.compile(
+        r"(?i)\b(source code|ground.?truth|known.?correct|answer key|"
+        r"the c code|the c/c\+\+ (?:code|source)|provided source(?: code)?|"
+        r"original source(?: code)?|given source(?: code)?|"
+        r"as (?:given|provided|shown) in the (?:c|c\+\+|source)|"
+        r"(?:was|am|were) (?:given|provided|shown) the (?:c|c\+\+|source) code)\b")
+    _n = _hits = 0
+    for split in ds.values():
+        for row in split:
+            _n += 1
+            if _SRC_REF.search(row["messages"][-1]["content"]):
+                _hits += 1
+    _frac = _hits / max(_n, 1)
+    print(f"[guard] gold source-reference rate: {_hits}/{_n} = {_frac:.3f}")
+    assert _frac <= 0.05, (
+        f"gold still references the source in {_frac:.1%} of rows (>5%); the "
+        f"ASM-faithful prompt did not take. Do NOT train on this data.")
 
     if eval_out:
         with open(eval_out, "w") as f:
