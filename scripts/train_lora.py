@@ -76,6 +76,13 @@ def to_features(ex):
 
 _local_rank = int(os.environ.get("LOCAL_RANK", "0"))  # torchrun sets this per-process; absent -> single-process (rank 0)
 
+# FSDP mode: accelerate sets this env var for every process under
+# `accelerate launch --use_fsdp`. Detected once here and threaded through
+# the model-load kwargs, TrainingArguments, and the final-save path below -
+# FSDP owns parameter placement/sharding and is incompatible with the
+# device_map="auto" pipeline-parallel path used otherwise.
+_FSDP = os.environ.get("ACCELERATE_USE_FSDP", "").lower() in ("1", "true", "yes")
+
 if DATA.startswith("gs://"):
     _local = "/content/dataset"
     _ready = os.path.join(_local, ".rsync_complete")
@@ -117,6 +124,23 @@ else:
     ds = load_dataset(DATA)
 ds = ds.map(to_features, remove_columns=ds["train"].column_names)
 ds = ds.filter(lambda r: r["input_ids"] is not None)
+
+_smoke_longest_n = int(os.environ.get("SMOKE_LONGEST_N", "0"))
+if _smoke_longest_n > 0:
+    # Worst-case memory validation, opt-in only. A short smoke run (a
+    # handful of optimizer steps) sampling randomly can miss the long tail
+    # of sequence lengths near MAXLEN that the full run will eventually
+    # hit - passing clean on short sequences and then OOMing hours into the
+    # $29.39/hr full run is the expensive failure mode this guards against.
+    # Order the train split longest-first and keep only the top N so a
+    # short smoke run is guaranteed to exercise near-MAXLEN activation
+    # memory. The full run must NOT set this env var.
+    _train = ds["train"]
+    _lens = [len(x) for x in _train["input_ids"]]
+    _order = sorted(range(len(_lens)), key=lambda i: -_lens[i])[:_smoke_longest_n]
+    ds["train"] = _train.select(_order)
+    print(f"[smoke] SMOKE_LONGEST_N={_smoke_longest_n}: train rows reordered longest-first, "
+          f"max len={_lens[_order[0]] if _order else 0}", flush=True)
 
 # Plain bf16 load (~70GB) - no quantization, no bnb, no monkeypatch. Needs an
 # 80GB+ GPU (Colab G4 = RTX PRO 6000 Blackwell, ~96GB). ImageTextToText is
@@ -176,9 +200,16 @@ elif _QLORA_4BIT and _already_quantized:
     if _max_memory:
         _load_kw["max_memory"] = _max_memory
 else:
-    _load_kw = dict(device_map=_device_map, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
-    if _max_memory:
-        _load_kw["max_memory"] = _max_memory
+    if _FSDP:
+        # FSDP owns placement: accelerate rank0-loads and broadcasts under
+        # cpu_ram_efficient_loading, other ranks init on meta. Passing
+        # device_map here is explicitly warned against by transformers
+        # (modeling_utils.py:4270) and breaks that contract.
+        _load_kw = dict(torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    else:
+        _load_kw = dict(device_map=_device_map, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+        if _max_memory:
+            _load_kw["max_memory"] = _max_memory
 if os.environ.get("FORCE_CAUSAL_LM", "0") == "1":
     model = AutoModelForCausalLM.from_pretrained(BASE, **_load_kw)
 else:
@@ -247,7 +278,7 @@ args = TrainingArguments(
     # errors (huggingface/transformers#29399 + Future exception swallowing).
     # We disable it and use our own callback that does blocking uploads.
     push_to_hub=False, prediction_loss_only=True,
-    load_best_model_at_end=True, metric_for_best_model="eval_loss", greater_is_better=False)
+    load_best_model_at_end=(not _FSDP), metric_for_best_model="eval_loss", greater_is_better=False)
 
 
 class HubCheckpointPusher(TrainerCallback):
@@ -352,14 +383,39 @@ if os.environ.get("RESUME"):
 
 trainer.train(resume_from_checkpoint=resume_path)
 
-# DDP: every rank reaches this point after trainer.train() returns. Only
-# rank 0 should write/push the final adapter - model.save_pretrained() and
-# push_to_hub() called directly (not via Trainer's own internal methods)
-# are NOT auto-gated by rank, unlike Trainer's own checkpoint saving.
-# Every process racing to write the same OUT dir / push concurrently would
+# Peak-memory diagnostic, every rank: cheap, always-on visibility into how
+# close a run came to OOM. Critical for the smoke test (3-15 steps of random
+# sampling can miss the long tail of sequence lengths that a long training
+# run will eventually hit) and useful headroom tracking on the full run too.
+if torch.cuda.is_available():
+    _peak_gib = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    print(f"[mem] rank {_local_rank} peak CUDA memory allocated: {_peak_gib:.2f} GiB", flush=True)
+
+# DDP: every rank reaches this point after trainer.train() returns.
+# trainer.save_model() under FSDP is a COLLECTIVE call - it all-gathers
+# sharded params across every rank internally (accelerator.save_model),
+# rank-gating the actual disk write itself. Guarding it with
+# is_world_process_zero() would make rank 0 block on a collective the other
+# ranks never join (they'd fall through to TRAINING_COMPLETE and exit) -
+# a deadlock discovered via transformers#24208 / accelerate collective-save
+# reports, confirmed against this exact plan. So it runs on ALL ranks here,
+# unconditionally. SHARDED_STATE_DICT (used during training for cheap
+# periodic checkpoints) only loads back into FSDP; the final adapter must
+# be gathered as FULL_STATE_DICT so it's a normal loadable PEFT directory -
+# cheap here since only 65M LoRA params need to be trainable-only gathered
+# (base weights still gather too, but this happens once, not per-checkpoint).
+if _FSDP:
+    trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
+    trainer.save_model(OUT)      # FSDP-aware state-dict gather, all ranks
+
+# Only rank 0 should write the tokenizer / push the final adapter -
+# push_to_hub() called directly (not via Trainer's own internal methods) is
+# NOT auto-gated by rank, unlike Trainer's own checkpoint saving. Every
+# process racing to write the same OUT dir / push concurrently would
 # corrupt the upload. Non-zero ranks skip straight to TRAINING_COMPLETE.
 if trainer.is_world_process_zero():
-    model.save_pretrained(OUT)
+    if not _FSDP:
+        model.save_pretrained(OUT)
     tok.save_pretrained(OUT)
 
     if CKPT_GCS:
