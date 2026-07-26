@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# HAWQ-SEC-RE v3 - multi-GPU DDP training launch on a GCE spot/on-demand VM.
-# Replaces the Colab autodrive.py path for this run per explicit steering:
-# "cluster this baby up" / "faster is better" - real data-parallel speedup
-# (not Colab's single-GPU G4) via torchrun + QLoRA-4bit DDP across N A100s
-# (see train_lora.py's LOCAL_RANK-aware device_map + GRAD_ACCUM scaling).
+# HAWQ-SEC-RE v3 - bf16 device_map=auto pipeline-parallel training launch
+# on a GCE on-demand VM (single process, no DDP). Chosen after confirming:
+# (1) QLoRA-4bit OOMs on a single 40GB A100 for this MoE arch (transformers
+#     materializes full-precision before quantizing); (2) an offline
+#     pre-quantized checkpoint didn't help either - the 256 expert-MLP
+#     layers aren't standard nn.Linear so bitsandbytes' quantizer skips
+#     them, checkpoint stayed ~63GB, barely smaller than bf16; (3) naive
+#     pipeline-parallel gives the SAME throughput on 2 vs 8 GPUs (layers
+#     execute sequentially either way) - 2x40GB A100 (80GB, fits the 65GB
+#     model with headroom) is the same speed as 8x for 4x less cost.
+#     User's explicit choice over the (untested, riskier) DDP-hybrid path.
 #
 # Usage:
 #   VM_NAME=hawq-v3-train ZONE=us-central1-a GPU_COUNT=8 \
@@ -21,13 +27,13 @@ set -eo pipefail  # NOT -u: macOS's bash 3.2 (default /bin/bash) errors on
 VM_NAME="${VM_NAME:-hawq-v3-train}"
 ZONE="${ZONE:-us-central1-a}"
 PROJECT="${PROJECT:-ewitness-dev}"
-MACHINE_TYPE="${MACHINE_TYPE:-a2-highgpu-8g}"
+MACHINE_TYPE="${MACHINE_TYPE:-a2-highgpu-2g}"
 GPU_TYPE="${GPU_TYPE:-nvidia-tesla-a100}"
-GPU_COUNT="${GPU_COUNT:-8}"
+GPU_COUNT="${GPU_COUNT:-2}"
 IMAGE_FAMILY="${IMAGE_FAMILY:-common-cu129-ubuntu-2204-nvidia-580}"
 IMAGE_PROJECT="${IMAGE_PROJECT:-deeplearning-platform-release}"
-BOOT_DISK_SIZE="${BOOT_DISK_SIZE:-400GB}"
-PREEMPTIBLE="${PREEMPTIBLE:-0}"  # 0 = on-demand (reliability > cost for an 8-GPU DDP run)
+BOOT_DISK_SIZE="${BOOT_DISK_SIZE:-300GB}"
+PREEMPTIBLE="${PREEMPTIBLE:-0}"  # 0 = on-demand (single-process pipeline run has no DDP resume-across-ranks story)
 
 ADAPTER_FULL="${ADAPTER_FULL:?set ADAPTER_FULL}"
 DATA_REPO="${DATA_REPO:?set DATA_REPO}"
@@ -36,9 +42,14 @@ GCS_KEY_FILE_LOCAL="${GCS_KEY_FILE_LOCAL:-}"
 LORA_R="${LORA_R:-64}"
 LORA_ALPHA="${LORA_ALPHA:-128}"
 MAXLEN="${MAXLEN:-3072}"
-# Global effective batch stays 16 regardless of GPU_COUNT (per-GPU grad_accum
-# scaled down so DDP parallelism cuts wall-clock, not the training dynamics).
-GRAD_ACCUM="$(( 16 / GPU_COUNT > 0 ? 16 / GPU_COUNT : 1 ))"
+# Single process (no DDP here) - full effective batch stays 16 regardless
+# of GPU_COUNT since pipeline-parallel splits ONE replica across GPUs,
+# it does not create multiple replicas to divide grad_accum across.
+GRAD_ACCUM="${GRAD_ACCUM:-16}"
+# Per-GPU memory budget for device_map=auto's placement planner. Left
+# generous (35GiB of 40GiB) since with only 1 replica (not N as in DDP)
+# there's ample headroom versus the ~65GB model across 2x40GB=80GB.
+MAX_MEMORY_GIB="${MAX_MEMORY_GIB:-35}"
 
 # The account's own gcloud reauth is stale in this environment and requires
 # an interactive browser login; Application Default Credentials remain
@@ -143,7 +154,7 @@ fi")"
     fi
     echo "[gce] base model resolved -> $_base_repo_resolved"
 
-    echo "[gce] launching torchrun (nproc_per_node=$GPU_COUNT, GRAD_ACCUM=$GRAD_ACCUM)"
+    echo "[gce] launching single-process bf16 pipeline (device_map=auto across $GPU_COUNT GPUs, GRAD_ACCUM=$GRAD_ACCUM)"
     launch_cmd="cd /content/razorstrike && pkill -f train_lora 2>/dev/null; sleep 2; \
 HF_HOME=/content/hf_home \
 HF_TOKEN='$HF_TOKEN' \
@@ -153,10 +164,10 @@ ADAPTER_REPO='$ADAPTER_FULL' \
 OUT_DIR=/content/adapter \
 MAXLEN=$MAXLEN LORA_R=$LORA_R LORA_ALPHA=$LORA_ALPHA \
 TARGET_MLP=0 SAVE_STEPS=250 EVAL_STEPS=250 MAX_STEPS=${MAX_STEPS:--1} FORCE_CAUSAL_LM=1 \
-QLORA_4BIT=1 GRAD_ACCUM=$GRAD_ACCUM \
+QLORA_4BIT=0 DEVICE_MAP=auto MAX_MEMORY_GIB=$MAX_MEMORY_GIB GRAD_ACCUM=$GRAD_ACCUM \
 CKPT_GCS='$CKPT_GCS' GCS_KEY_FILE=/content/gcs-key.json GCS_PROJECT='$PROJECT' \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-nohup python3 -m torch.distributed.run --nproc_per_node=$GPU_COUNT -m scripts.train_lora > /content/train.log 2>&1 &
+nohup python3 -u -m scripts.train_lora > /content/train.log 2>&1 &
 sleep 5
 pgrep -af train_lora || echo NOT_RUNNING"
     _ssh "$launch_cmd"
