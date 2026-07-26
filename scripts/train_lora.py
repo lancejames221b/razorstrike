@@ -332,11 +332,29 @@ class GcsCheckpointPusher(TrainerCallback):
             print(f"[push] {name} FAIL {type(e).__name__}: {e}", flush=True)
 
 
+class FsdpMemoryCleanupCallback(TrainerCallback):
+    """FSDP-only: gc.collect() + empty_cache() right after eval, before the
+    periodic checkpoint save that follows in the same _maybe_log_save_evaluate
+    call. Confirmed necessary empirically, not speculative: a smoke run at
+    MAXLEN=4096 with worst-case-length rows crashed with RuntimeError: NCCL
+    Error 1 (unhandled cuda error) inside Trainer._save_checkpoint's DCP
+    gather_object, with GPUs at ~40/41GB right after eval. Eval leaves the
+    caching allocator's reserve fragmented; the checkpoint's collective
+    gather_object needs a small but fresh GPU buffer and has no retry path
+    of its own. This closes exactly that gap on every periodic save, not
+    just the final one."""
+    def on_evaluate(self, args, state, control, **kwargs):
+        if _FSDP:
+            gc.collect()
+            torch.cuda.empty_cache()
+
+
 trainer = Trainer(model=model, args=args,
     train_dataset=ds["train"], eval_dataset=ds["validation"],
     data_collator=DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True),
     callbacks=[GcsCheckpointPusher() if CKPT_GCS else HubCheckpointPusher(),
-               EarlyStoppingCallback(early_stopping_patience=3)])
+               EarlyStoppingCallback(early_stopping_patience=3),
+               FsdpMemoryCleanupCallback()])
 
 resume_path = None
 if os.environ.get("RESUME"):
