@@ -45,10 +45,11 @@ GRAD_ACCUM="$(( 16 / GPU_COUNT > 0 ? 16 / GPU_COUNT : 1 ))"
 # minutes, longer than a single token's safety margin).
 _tok() { gcloud auth application-default print-access-token; }
 
-# gcloud compute ssh --tunnel-through-iap is confirmed flaky under rapid
-# reconnects even when the VM itself is healthy (ERROR: [/usr/bin/ssh]
-# exited with return code [255], VM status/connectivity checks all clean).
-# Retry with backoff rather than treating one failure as VM death.
+# gcloud compute ssh --tunnel-through-iap was confirmed unreliable here
+# (repeated ERROR: [/usr/bin/ssh] exited with return code [255] while VM
+# status/connectivity checks were all clean) - direct SSH via the VM's
+# external IP worked reliably in the same session. Default to direct SSH;
+# set USE_IAP=1 to force the tunnel (e.g. if the VM has no external IP).
 _gcloud() {
   local i
   for i in 1 2 3 4 5; do
@@ -58,10 +59,12 @@ _gcloud() {
   done
   return 1
 }
+USE_IAP="${USE_IAP:-0}"
 _ssh() {
-  local i
+  local i iap_flag=()
+  if [ "$USE_IAP" = "1" ]; then iap_flag=(--tunnel-through-iap); fi
   for i in 1 2 3 4 5; do
-    if CLOUDSDK_AUTH_ACCESS_TOKEN="$(_tok)" gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --tunnel-through-iap --command="$1"; then return 0; fi
+    if CLOUDSDK_AUTH_ACCESS_TOKEN="$(_tok)" gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT" "${iap_flag[@]}" --command="$1"; then return 0; fi
     echo "[gce] ssh call failed (attempt $i/5), retrying in $((i*10))s..." >&2
     sleep $((i*10))
   done
@@ -104,8 +107,9 @@ case "$cmd" in
 
     if [ -n "$GCS_KEY_FILE_LOCAL" ]; then
       echo "[gce] uploading GCS service-account key (never committed to the repo)"
+      _scp_iap_flag=(); if [ "$USE_IAP" = "1" ]; then _scp_iap_flag=(--tunnel-through-iap); fi
       _gcloud compute scp "$GCS_KEY_FILE_LOCAL" "$VM_NAME:/content/gcs-key.json" \
-        --zone="$ZONE" --project="$PROJECT" --tunnel-through-iap
+        --zone="$ZONE" --project="$PROJECT" "${_scp_iap_flag[@]}"
     fi
 
     # Pre-download the base model ONCE before torchrun spins up N ranks.
