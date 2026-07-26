@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
-# HAWQ-SEC-RE v3 - bf16 device_map=auto pipeline-parallel training launch
-# on a GCE on-demand VM (single process, no DDP). Chosen after confirming:
+# HAWQ-SEC-RE v3 training launch on a GCE on-demand VM. Two modes:
+#
+# FSDP=1: real data-parallel via `accelerate launch --use_fsdp`, sharding
+# raw parameters - including the fused MoE expert nn.Parameter tensors that
+# make 92.9% of this model unquantizable by bitsandbytes. Requires >=4 GPUs
+# (per-GPU sharded weight budget). The committed approach once smoke-tested.
+#
+# FSDP unset/0 (default): bf16 device_map=auto pipeline-parallel, single
+# process, no DDP. Kept as fallback. Chosen originally after confirming:
 # (1) QLoRA-4bit OOMs on a single 40GB A100 for this MoE arch (transformers
 #     materializes full-precision before quantizing); (2) an offline
 #     pre-quantized checkpoint didn't help either - the 256 expert-MLP
 #     layers aren't standard nn.Linear so bitsandbytes' quantizer skips
 #     them, checkpoint stayed ~63GB, barely smaller than bf16; (3) naive
 #     pipeline-parallel gives the SAME throughput on 2 vs 8 GPUs (layers
-#     execute sequentially either way) - 2x40GB A100 (80GB, fits the 65GB
-#     model with headroom) is the same speed as 8x for 4x less cost.
-#     User's explicit choice over the (untested, riskier) DDP-hybrid path.
+#     execute sequentially either way) - capacity-only, no real speedup.
 #
-# Usage:
-#   VM_NAME=hawq-v3-train ZONE=us-central1-a GPU_COUNT=8 \
+# Usage (FSDP):
+#   VM_NAME=hawq-v3-train ZONE=us-central1-f GPU_COUNT=4 MACHINE_TYPE=a2-highgpu-4g \
+#   FSDP=1 GRAD_ACCUM=4 \
 #   ADAPTER_FULL=lancejames221b/HAWQ-SEC-RE-lora-v3 \
 #   DATA_REPO=gs://hawq-training-us-central1/datasets/hawq-re-v3 \
 #   CKPT_GCS=gs://hawq-training-us-central1/checkpoints \
+#   MAXLEN=4096 SAVE_STEPS=250 EVAL_STEPS=250 \
 #   GCS_KEY_FILE_LOCAL=/Volumes/SeXternal/hawq_v3/hawq-training-vm-key.json \
 #       ./scripts/gce_cluster_train.sh create      # provision + launch
 #   ./scripts/gce_cluster_train.sh status           # check training log
 #   ./scripts/gce_cluster_train.sh teardown         # delete the VM
+#
+# GRAD_ACCUM * GPU_COUNT must equal 16 (the tuned global effective batch)
+# under FSDP=1 - enforced below, not left to silently default wrong.
 set -eo pipefail  # NOT -u: macOS's bash 3.2 (default /bin/bash) errors on
                   # "${empty_array[@]}" under nounset - required vars below
                   # already use ${VAR:?msg} for explicit enforcement instead.
@@ -44,12 +54,35 @@ LORA_ALPHA="${LORA_ALPHA:-128}"
 MAXLEN="${MAXLEN:-3072}"
 # Single process (no DDP here) - full effective batch stays 16 regardless
 # of GPU_COUNT since pipeline-parallel splits ONE replica across GPUs,
-# it does not create multiple replicas to divide grad_accum across.
+# it does not create multiple replicas to divide grad_accum across. FSDP
+# mode is real data-parallel (one replica shard per rank), so its effective
+# batch = per_device(1) * GRAD_ACCUM * GPU_COUNT - GRAD_ACCUM must scale
+# inversely with GPU_COUNT to hold the tuned LR/schedule constant. No
+# implicit default for FSDP: forgetting to recompute it when GPU_COUNT
+# changes was flagged as a known trap, so it's enforced below instead of
+# silently defaulting wrong.
 GRAD_ACCUM="${GRAD_ACCUM:-16}"
 # Per-GPU memory budget for device_map=auto's placement planner. Left
 # generous (35GiB of 40GiB) since with only 1 replica (not N as in DDP)
 # there's ample headroom versus the ~65GB model across 2x40GB=80GB.
 MAX_MEMORY_GIB="${MAX_MEMORY_GIB:-35}"
+
+# FSDP mode: real data-parallel via accelerate launch --use_fsdp instead of
+# the single-process device_map=auto pipeline above. Chosen because FSDP
+# shards raw parameters - including the fused MoE expert nn.Parameter
+# tensors that make 92.9% of this model unquantizable by bitsandbytes and
+# that pipeline-parallel just accepts (capacity-only, same throughput on
+# 2 vs 8 GPUs since layers execute sequentially either way).
+FSDP="${FSDP:-0}"
+TARGET_MLP="${TARGET_MLP:-0}"
+SAVE_STEPS="${SAVE_STEPS:-250}"
+EVAL_STEPS="${EVAL_STEPS:-250}"
+MAX_STEPS="${MAX_STEPS:--1}"
+SMOKE_LONGEST_N="${SMOKE_LONGEST_N:-0}"
+if [ "$FSDP" = "1" ] && [ $((GRAD_ACCUM * GPU_COUNT)) -ne 16 ]; then
+  echo "[gce] ERROR: FSDP=1 requires GRAD_ACCUM * GPU_COUNT == 16 (global effective batch, matches the tuned LR/schedule). Got GRAD_ACCUM=$GRAD_ACCUM * GPU_COUNT=$GPU_COUNT = $((GRAD_ACCUM * GPU_COUNT))." >&2
+  exit 1
+fi
 
 # The account's own gcloud reauth is stale in this environment and requires
 # an interactive browser login; Application Default Credentials remain
@@ -154,8 +187,76 @@ fi")"
     fi
     echo "[gce] base model resolved -> $_base_repo_resolved"
 
-    echo "[gce] launching single-process bf16 pipeline (device_map=auto across $GPU_COUNT GPUs, GRAD_ACCUM=$GRAD_ACCUM)"
-    launch_cmd="cd /content/razorstrike && pkill -f train_lora 2>/dev/null; sleep 2; \
+    if [ "$FSDP" = "1" ]; then
+      echo "[gce] launching FSDP (real data-parallel, --use_fsdp across $GPU_COUNT GPUs, GRAD_ACCUM=$GRAD_ACCUM, MAXLEN=$MAXLEN)"
+      _fsdp_local=$(mktemp)
+      cat > "$_fsdp_local" <<FSDPLAUNCH
+#!/bin/bash
+set -e
+cd /content/razorstrike
+git fetch origin -q && git reset --hard origin/main -q
+echo "[launch] at commit: \$(git log -1 --format='%H %s')"
+
+# Robust teardown before relaunch: pkill alone + a fixed sleep is not
+# enough to reclaim GPU memory from a process holding tens of GB - poll
+# until the process is actually gone, then verify every GPU is near-0 MiB
+# before handing off to FSDP. Bracket trick ([t]rain_lora) so the pattern
+# doesn't match this very shell's own cmdline (confirmed self-match bug:
+# an inline SSH --command containing the literal pattern text kills its
+# own remote shell and gcloud reports exit 255, misread as connectivity
+# flakiness rather than the self-inflicted kill it actually is).
+pkill -f "[t]rain_lora" 2>/dev/null || true
+for i in \$(seq 1 30); do
+  pgrep -f "[t]rain_lora" >/dev/null || break
+  sleep 2
+done
+if pgrep -f "[t]rain_lora" >/dev/null; then
+  echo "[launch] WARNING: train_lora process still alive after 60s, force-killing"
+  pkill -9 -f "[t]rain_lora" 2>/dev/null || true
+  sleep 3
+fi
+echo "[launch] GPU memory before FSDP launch:"
+nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader
+
+HF_HOME=/content/hf_home \\
+HF_TOKEN='$HF_TOKEN' \\
+BASE_REPO='$_base_repo_resolved' \\
+DATA_REPO='$DATA_REPO' \\
+ADAPTER_REPO='$ADAPTER_FULL' \\
+CKPT_GCS='$CKPT_GCS' \\
+OUT_DIR=/content/adapter \\
+MAXLEN=$MAXLEN LORA_R=$LORA_R LORA_ALPHA=$LORA_ALPHA \\
+TARGET_MLP=$TARGET_MLP SAVE_STEPS=$SAVE_STEPS EVAL_STEPS=$EVAL_STEPS MAX_STEPS=$MAX_STEPS FORCE_CAUSAL_LM=1 \\
+QLORA_4BIT=0 GRAD_ACCUM=$GRAD_ACCUM \\
+SMOKE_LONGEST_N=$SMOKE_LONGEST_N \\
+GCS_KEY_FILE=/content/gcs-key.json GCS_PROJECT='$PROJECT' \\
+PYTHONUNBUFFERED=1 \\
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
+nohup python3 -m accelerate.commands.launch \\
+  --num_processes $GPU_COUNT --num_machines 1 --mixed_precision bf16 \\
+  --use_fsdp \\
+  --fsdp_version 1 \\
+  --fsdp_sharding_strategy FULL_SHARD \\
+  --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP \\
+  --fsdp_transformer_layer_cls_to_wrap Qwen3_5MoeDecoderLayer \\
+  --fsdp_use_orig_params true \\
+  --fsdp_cpu_ram_efficient_loading true \\
+  --fsdp_sync_module_states true \\
+  --fsdp_state_dict_type SHARDED_STATE_DICT \\
+  --fsdp_backward_prefetch BACKWARD_PRE \\
+  -m scripts.train_lora > /content/train.log 2>&1 &
+disown
+sleep 3
+echo LAUNCHED
+pgrep -af "[a]ccelerate" || echo NOT_RUNNING
+FSDPLAUNCH
+      _scp_iap_flag=(); if [ "$USE_IAP" = "1" ]; then _scp_iap_flag=(--tunnel-through-iap); fi
+      _gcloud compute scp "$_fsdp_local" "$VM_NAME:/tmp/fsdp_launch.sh" --zone="$ZONE" --project="$PROJECT" "${_scp_iap_flag[@]}"
+      rm -f "$_fsdp_local"
+      _ssh "bash /tmp/fsdp_launch.sh"
+    else
+      echo "[gce] launching single-process bf16 pipeline (device_map=auto across $GPU_COUNT GPUs, GRAD_ACCUM=$GRAD_ACCUM)"
+      launch_cmd="cd /content/razorstrike && pkill -f train_lora 2>/dev/null; sleep 2; \
 HF_HOME=/content/hf_home \
 HF_TOKEN='$HF_TOKEN' \
 BASE_REPO='$_base_repo_resolved' \
@@ -170,12 +271,13 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 nohup python3 -u -m scripts.train_lora > /content/train.log 2>&1 &
 sleep 5
 pgrep -af train_lora || echo NOT_RUNNING"
-    _ssh "$launch_cmd"
+      _ssh "$launch_cmd"
+    fi
     echo "[gce] launched. Check with: $0 status"
     ;;
 
   status)
-    _ssh "tail -50 /content/train.log 2>/dev/null; echo ---; pgrep -af train_lora >/dev/null && echo STILL_RUNNING || echo PROCESS_EXITED"
+    _ssh "tail -50 /content/train.log 2>/dev/null; echo ---; pgrep -af '[t]rain_lora|[a]ccelerate' >/dev/null && echo STILL_RUNNING || echo PROCESS_EXITED"
     ;;
 
   teardown)
