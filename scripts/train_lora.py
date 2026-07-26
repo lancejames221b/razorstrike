@@ -86,9 +86,16 @@ if DATA.startswith("gs://"):
     # any particular startup ordering.
     if _local_rank == 0:
         _gcs_activate()
+        # Clear any stale sentinel from a prior run/relaunch on this VM
+        # BEFORE starting the rsync - otherwise a waiting non-zero rank
+        # could see a leftover sentinel from a previous (possibly
+        # different DATA_REPO) run and load_from_disk a stale/wrong
+        # dataset while rank 0 is still overwriting it underneath.
+        if os.path.exists(_ready):
+            os.remove(_ready)
         subprocess.run(["gcloud", "storage", "rsync", "-r", DATA, _local], check=True)
         with open(_ready, "w") as _f:
-            _f.write("ok")
+            _f.write(DATA)  # record which DATA_REPO this sentinel corresponds to
     else:
         import time as _time
         _waited = 0
@@ -98,6 +105,12 @@ if DATA.startswith("gs://"):
             if _waited > 1800:
                 raise RuntimeError(f"rank {_local_rank}: timed out waiting 30min for "
                                     f"rank 0's dataset download ({_ready} never appeared)")
+        with open(_ready) as _f:
+            _sentinel_data = _f.read().strip()
+        if _sentinel_data != DATA:
+            raise RuntimeError(f"rank {_local_rank}: sentinel records DATA_REPO="
+                                f"{_sentinel_data!r} but this process expects {DATA!r} - "
+                                f"stale sentinel from a different run, refusing to load")
     from datasets import load_from_disk
     ds = load_from_disk(_local)
 else:
