@@ -14,7 +14,9 @@
 #       ./scripts/gce_cluster_train.sh create      # provision + launch
 #   ./scripts/gce_cluster_train.sh status           # check training log
 #   ./scripts/gce_cluster_train.sh teardown         # delete the VM
-set -euo pipefail
+set -eo pipefail  # NOT -u: macOS's bash 3.2 (default /bin/bash) errors on
+                  # "${empty_array[@]}" under nounset - required vars below
+                  # already use ${VAR:?msg} for explicit enforcement instead.
 
 VM_NAME="${VM_NAME:-hawq-v3-train}"
 ZONE="${ZONE:-us-central1-a}"
