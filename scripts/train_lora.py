@@ -349,12 +349,23 @@ class FsdpMemoryCleanupCallback(TrainerCallback):
             torch.cuda.empty_cache()
 
 
+_callbacks = [GcsCheckpointPusher() if CKPT_GCS else HubCheckpointPusher(),
+              FsdpMemoryCleanupCallback()]
+# EarlyStoppingCallback still halts training (control.should_training_stop)
+# even when load_best_model_at_end=False - it just skips the auto-revert-to-
+# best step. Under FSDP that leaves only the downside: 476 validation rows
+# is a noisy eval_loss signal, ~12 evals at EVAL_STEPS=250 make 3 consecutive
+# non-improving reads plausible, and a premature stop would silently ship
+# the LAST (not best) state, truncated well short of 2 full epochs, while
+# still printing TRAINING_COMPLETE - indistinguishable from a clean finish
+# without checking global_step. Not worth the risk on a multi-hour paid run.
+if not _FSDP:
+    _callbacks.append(EarlyStoppingCallback(early_stopping_patience=3))
+
 trainer = Trainer(model=model, args=args,
     train_dataset=ds["train"], eval_dataset=ds["validation"],
     data_collator=DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True),
-    callbacks=[GcsCheckpointPusher() if CKPT_GCS else HubCheckpointPusher(),
-               EarlyStoppingCallback(early_stopping_patience=3),
-               FsdpMemoryCleanupCallback()])
+    callbacks=_callbacks)
 
 resume_path = None
 if os.environ.get("RESUME"):
@@ -400,6 +411,10 @@ if os.environ.get("RESUME"):
             print(f"[resume] no hub checkpoint found ({type(e).__name__}: {e}); starting fresh")
 
 trainer.train(resume_from_checkpoint=resume_path)
+print(f"[steps] completed global_step={trainer.state.global_step} of expected "
+      f"max_steps={trainer.state.max_steps} - a mismatch means training stopped "
+      f"early (e.g. EarlyStoppingCallback), not that it ran to completion.",
+      flush=True)
 
 # Peak-memory diagnostic, every rank: cheap, always-on visibility into how
 # close a run came to OOM. Critical for the smoke test (3-15 steps of random
