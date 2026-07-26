@@ -44,8 +44,29 @@ GRAD_ACCUM="$(( 16 / GPU_COUNT > 0 ? 16 / GPU_COUNT : 1 ))"
 # instead (refreshed per-call since VM boot + bootstrap can span many
 # minutes, longer than a single token's safety margin).
 _tok() { gcloud auth application-default print-access-token; }
-_gcloud() { CLOUDSDK_AUTH_ACCESS_TOKEN="$(_tok)" gcloud "$@"; }
-_ssh() { CLOUDSDK_AUTH_ACCESS_TOKEN="$(_tok)" gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --tunnel-through-iap --command="$1"; }
+
+# gcloud compute ssh --tunnel-through-iap is confirmed flaky under rapid
+# reconnects even when the VM itself is healthy (ERROR: [/usr/bin/ssh]
+# exited with return code [255], VM status/connectivity checks all clean).
+# Retry with backoff rather than treating one failure as VM death.
+_gcloud() {
+  local i
+  for i in 1 2 3 4 5; do
+    if CLOUDSDK_AUTH_ACCESS_TOKEN="$(_tok)" gcloud "$@"; then return 0; fi
+    echo "[gce] gcloud call failed (attempt $i/5), retrying in $((i*10))s..." >&2
+    sleep $((i*10))
+  done
+  return 1
+}
+_ssh() {
+  local i
+  for i in 1 2 3 4 5; do
+    if CLOUDSDK_AUTH_ACCESS_TOKEN="$(_tok)" gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --tunnel-through-iap --command="$1"; then return 0; fi
+    echo "[gce] ssh call failed (attempt $i/5), retrying in $((i*10))s..." >&2
+    sleep $((i*10))
+  done
+  return 1
+}
 
 cmd="${1:-}"
 
