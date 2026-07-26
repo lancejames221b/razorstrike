@@ -145,13 +145,34 @@ _max_mem_gib = os.environ.get("MAX_MEMORY_GIB", "").strip()
 _max_memory = None
 if _max_mem_gib and _device_map == "auto":
     _max_memory = {i: f"{_max_mem_gib}GiB" for i in range(torch.cuda.device_count())}
+# A checkpoint already saved in 4-bit (via bitsandbytes' own save/load
+# support) carries its own quantization_config in config.json - passing a
+# FRESH BitsAndBytesConfig on top of that is what triggers the OOM bug
+# (transformers' loader materializes the source tensor at full precision
+# before quantizing it AGAIN). Detect an already-quantized checkpoint and
+# skip re-quantization entirely - it loads its saved 4-bit tensors
+# directly, no full-precision materialization step at all.
+_already_quantized = False
 if _QLORA_4BIT:
+    try:
+        from transformers import AutoConfig
+        _already_quantized = getattr(AutoConfig.from_pretrained(BASE), "quantization_config", None) is not None
+    except Exception:
+        _already_quantized = False
+    if _already_quantized:
+        print(f"[load] {BASE} is already 4-bit quantized - loading directly, no re-quantization", flush=True)
+if _QLORA_4BIT and not _already_quantized:
     from transformers import BitsAndBytesConfig
     from peft import prepare_model_for_kbit_training
     _bnb_cfg = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
     _load_kw = dict(device_map=_device_map, quantization_config=_bnb_cfg, low_cpu_mem_usage=True)
+    if _max_memory:
+        _load_kw["max_memory"] = _max_memory
+elif _QLORA_4BIT and _already_quantized:
+    from peft import prepare_model_for_kbit_training
+    _load_kw = dict(device_map=_device_map, low_cpu_mem_usage=True)
     if _max_memory:
         _load_kw["max_memory"] = _max_memory
 else:
