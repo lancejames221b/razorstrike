@@ -286,6 +286,8 @@ class HubCheckpointPusher(TrainerCallback):
     Unlike push_to_hub=True, this uses run_as_future=False so upload errors
     are raised synchronously and logged, not silently swallowed."""
     def on_save(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
         from huggingface_hub import create_repo
         ckpts = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")),
                        key=lambda p: int(p.split("-")[-1]))
@@ -317,6 +319,8 @@ class GcsCheckpointPusher(TrainerCallback):
     failed GCS upload never kills training (caught, printed, not re-raised -
     mirrors HubCheckpointPusher's behavior exactly)."""
     def on_save(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
         ckpts = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")),
                        key=lambda p: int(p.split("-")[-1]))
         if not ckpts:
@@ -367,6 +371,53 @@ trainer = Trainer(model=model, args=args,
     data_collator=DataCollatorForSeq2Seq(tok, label_pad_token_id=-100, padding=True),
     callbacks=_callbacks)
 
+def _gcs_checkpoint_complete(gcs_dir, world_size):
+    """A checkpoint-N dir in GCS is resumable iff its save-format-specific
+    artifacts are all present at non-truncated size. Under FSDP
+    (SHARDED_STATE_DICT) that means the DCP model/optimizer dirs each have
+    .metadata + exactly world_size __i_0.distcp shards of near-uniform
+    size; under the non-FSDP single-process pipeline path (CKPT_GCS is
+    independent of _FSDP - see gce_cluster_train.sh's device_map=auto
+    branch) checkpoints are plain single-file PEFT/optimizer dumps with no
+    DCP sharding at all, so the DCP check would reject every checkpoint
+    (missing pytorch_model_fsdp_0/.metadata) and silently restart training
+    from step 0. Either way, plus trainer_state.json in both modes. A
+    crash mid-push (GcsCheckpointPusher is a plain rsync with no
+    manifest/commit step) leaves a subset of these objects - resuming
+    from that silently corrupts the run. Returns (ok: bool, why: str)."""
+    r = subprocess.run(["gcloud", "storage", "ls", "-l", "-r", gcs_dir.rstrip("/") + "/**"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, f"ls failed: {r.stderr.strip()[:200]}"
+    sizes = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].isdigit():
+            sizes[parts[-1]] = int(parts[0])
+    if not any(k.endswith("/trainer_state.json") for k in sizes):
+        return False, "missing trainer_state.json"
+    if not _FSDP:
+        for name in ("adapter_model.safetensors", "optimizer.pt"):
+            match = [v for k, v in sizes.items() if k.endswith(f"/{name}")]
+            if not match:
+                return False, f"missing {name}"
+            if match[0] == 0:
+                return False, f"{name} is 0 bytes (truncated upload)"
+        return True, "ok"
+    def shards(sub):
+        return sorted(v for k, v in sizes.items()
+                      if f"/{sub}/" in k and k.endswith(".distcp"))
+    for sub in ("pytorch_model_fsdp_0", "optimizer_0"):
+        if not any(k.endswith(f"/{sub}/.metadata") for k in sizes):
+            return False, f"missing {sub}/.metadata"
+        s = shards(sub)
+        if len(s) != world_size:
+            return False, f"{sub}: {len(s)} distcp shards, expected {world_size}"
+        if s and s[0] < 0.9 * s[-1]:
+            return False, f"{sub}: shard size spread {s[0]}..{s[-1]} exceeds 10% (truncated upload)"
+    return True, "ok"
+
+
 resume_path = None
 if os.environ.get("RESUME"):
     if CKPT_GCS:
@@ -381,8 +432,17 @@ if os.environ.get("RESUME"):
                 {line.strip().rstrip("/") for line in r.stdout.splitlines()
                  if "/checkpoint-" in line},
                 key=lambda s: int(s.rsplit("-", 1)[-1]))
-            if ckpt_dirs:
-                latest = ckpt_dirs[-1]
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            latest = None
+            for cand in reversed(ckpt_dirs):
+                ok, why = _gcs_checkpoint_complete(cand, world_size)
+                if ok:
+                    latest = cand
+                    break
+                cand_name = cand.rsplit("/", 1)[-1]
+                print(f"[resume] SKIPPING {cand_name}: {why} (partial push - delete it in GCS or it will be re-checked next resume)")
+            if latest:
+                # shard count == WORLD_SIZE enforced by _gcs_checkpoint_complete: a 2- or 8-GPU relaunch cannot load these 4-shard checkpoints
                 name = latest.rsplit("/", 1)[-1]
                 resume_path = os.path.join(OUT, name)
                 subprocess.run(["gcloud", "storage", "rsync", "-r", latest, resume_path], check=True)
