@@ -189,8 +189,9 @@ def _patch_adapter_dir(src_dir):
     from safetensors.torch import safe_open, save_file
     dst_dir = tempfile.mkdtemp(prefix="adapter_patched_")
     for fname in os.listdir(src_dir):
-        if fname != "adapter_model.safetensors":
-            shutil.copy(os.path.join(src_dir, fname), os.path.join(dst_dir, fname))
+        fpath = os.path.join(src_dir, fname)
+        if fname != "adapter_model.safetensors" and os.path.isfile(fpath):
+            shutil.copy(fpath, os.path.join(dst_dir, fname))
     src_path = os.path.join(src_dir, "adapter_model.safetensors")
     tensors = {}
     with safe_open(src_path, framework="pt") as f:
