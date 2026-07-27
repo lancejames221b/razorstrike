@@ -20,9 +20,9 @@ from peft import PeftModel
 
 BASE         = os.environ.get("BASE_REPO", "lancejames221b/HAWQ-v1")
 ADAPTER_DIR  = os.environ.get("ADAPTER_DIR", "/content/adapter")
-ADAPTER_REPO = os.environ.get("ADAPTER_REPO", "lancejames221b/HAWQ-SEC-lora")
+ADAPTER_REPO = os.environ.get("ADAPTER_REPO", "lancejames221b/HAWQ-SEC-RE-lora-v3")
 MERGED_DIR   = os.environ.get("MERGED_DIR", "/content/merged")
-MERGED_REPO  = os.environ.get("MERGED_REPO", "lancejames221b/HAWQ-SEC")
+MERGED_REPO  = os.environ.get("MERGED_REPO", "lancejames221b/HAWQ-SEC-RE")
 TOKEN        = os.environ.get("HF_TOKEN")
 
 MODEL_CARD = f"""---
@@ -33,36 +33,30 @@ tags:
 - moe
 - lora
 - reasoning
-- agentic
-- coding
-- security
 - reverse-engineering
-- cryptography
-- offensive-security
+- decompilation
+- security
 language:
 - en
 pipeline_tag: text-generation
 library_name: transformers
 ---
 
-# HAWQ-SEC
+# HAWQ-SEC-RE
 
-HAWQ-SEC is a **LoRA SFT** fine-tune of the **HAWQ-v1** base
-({BASE}), a Holo3+Qwopus+AgentWorld merge on Qwen3.6-35B-A3B (hybrid
-linear-attention/SSM MoE architecture, 256 experts, text-only CausalLM).
-The LoRA adapter is trained on a full 8-family SFT mix (decompile/RE,
-crypto_id, ransomware-crypto, math, cyber, loop_recovery, mythos, uncensor),
-then merged back into the base.
+LoRA SFT fine-tune of HAWQ-v1 teaching faithful reverse-engineering **analysis** of
+x86-64 assembly (purpose, I/O, algorithm, security-relevant behavior).
 
 ## Training
 
-- Base: `{BASE}` (Holo3+Qwopus+AgentWorld merge on Qwen3.6-35B-A3B, text-only CausalLM)
+- Base: `{BASE}` (Holo3+Qwopus+AgentWorld merge on Qwen3.6-35B-A3B, hybrid
+  linear-attention/SSM MoE architecture, 256 experts, text-only CausalLM)
 - Method: LoRA SFT via `transformers` + `peft`, response-only prompt-prefix
   masking (no TRL, avoiding a v5-transformers compatibility risk)
-- Data: `lancejames221b/hawq-sec-sft` - 8-family mix (decompile/RE, crypto_id,
-  ransomware-crypto, math, cyber, loop_recovery, mythos, uncensor)
-- 2 epochs (`MAX_STEPS=-1`), `MAXLEN=3072`, LoRA rank/alpha per `adapter_config.json`,
-  best-eval-loss checkpoint (early-stopping patience 3)
+- Data: `hawq-re-v3` - RE-analysis + decompile families from
+  LLM4Binary/decompile-bench with frontier-generated gold analyses
+- 4x A100 FSDP, 2 epochs, MAXLEN=4096, r=64/alpha=128, attention+SSM target
+  modules
 
 ## License
 
@@ -90,12 +84,82 @@ def resolve_adapter_dir():
     return snapshot_download(ADAPTER_REPO, token=TOKEN)
 
 
+def _patch_adapter_dir(src_dir):
+    """Mirror eval_peft_direct.py's _patch_adapter_dir: strip any
+    `.language_model.` segment from the adapter's saved LoRA keys before
+    loading. Safe no-op if the segment isn't present (str.replace on a
+    missing substring is a no-op) - always applied defensively since this
+    script, like the eval harness, loads a text-only CausalLM base whose
+    key names may not match what the adapter was trained against."""
+    import shutil, tempfile
+    from safetensors.torch import safe_open, save_file
+    dst_dir = tempfile.mkdtemp(prefix="adapter_patched_")
+    for fname in os.listdir(src_dir):
+        fpath = os.path.join(src_dir, fname)
+        if fname != "adapter_model.safetensors" and os.path.isfile(fpath):
+            shutil.copy(fpath, os.path.join(dst_dir, fname))
+    src_path = os.path.join(src_dir, "adapter_model.safetensors")
+    tensors = {}
+    with safe_open(src_path, framework="pt") as f:
+        for k in f.keys():
+            tensors[k.replace(".language_model.", ".")] = f.get_tensor(k)
+    save_file(tensors, os.path.join(dst_dir, "adapter_model.safetensors"))
+    return dst_dir
+
+
 def main():
-    adapter_path = resolve_adapter_dir()
+    adapter_path = _patch_adapter_dir(resolve_adapter_dir())
 
     base = load_base()
-    m = PeftModel.from_pretrained(base, adapter_path)
-    m = m.merge_and_unload()
+    peft_model = PeftModel.from_pretrained(base, adapter_path)
+
+    # Load-bearing no-op-merge check (skill gguf-qwen35moe-lora-deploy-lmstudio):
+    # a key-prefix mismatch between the adapter and the base module tree makes
+    # merge_and_unload() silently no-op (UserWarning, not an exception) and
+    # ship the unmodified base under a new name. Snapshot real q_proj weight
+    # slices from every LoRA-wrapped attention layer before merge (discovered
+    # from the state dict, not hardcoded layer indices - only 10/40 layers
+    # are full-attention here), diff a strided sample after.
+    _pre_sd = peft_model.state_dict()
+    _q_keys = sorted(k for k in _pre_sd if k.endswith("self_attn.q_proj.base_layer.weight"))
+    if not _q_keys:
+        # Some peft versions proxy .weight straight through instead of
+        # nesting the original weight under .base_layer.
+        _q_keys = sorted(k for k in _pre_sd
+                          if k.endswith("self_attn.q_proj.weight") and ".lora_" not in k)
+    if not _q_keys:
+        print("[merge] FATAL: no q_proj target-module keys found in the "
+              "pre-merge state dict - can't verify the merge isn't a no-op", flush=True)
+        raise SystemExit(4)
+    _stride = max(1, len(_q_keys) // 5)
+    _sample_keys = _q_keys[::_stride][:5]
+    _pre_snap = {k: _pre_sd[k][:2, :2].clone() for k in _sample_keys}
+    print(f"[merge] snapshotted {len(_pre_snap)}/{len(_q_keys)} q_proj slices "
+          f"pre-merge: {_sample_keys}", flush=True)
+
+    m = peft_model.merge_and_unload()
+
+    _post_sd = m.state_dict()
+    _n_changed = 0
+    for k, pre_val in _pre_snap.items():
+        post_key = k.replace("base_model.model.", "", 1).replace(".base_layer.weight", ".weight")
+        post_val = _post_sd.get(post_key)
+        if post_val is None:
+            print(f"[merge] FATAL: post-merge key {post_key!r} (from {k!r}) not found", flush=True)
+            raise SystemExit(4)
+        post_val = post_val[:2, :2]
+        if not torch.isfinite(post_val).all():
+            print(f"[merge] FATAL: post-merge slice for {post_key} contains NaN/Inf", flush=True)
+            raise SystemExit(4)
+        if not torch.equal(pre_val, post_val):
+            _n_changed += 1
+    if _n_changed == 0:
+        print("[merge] FATAL: merge_and_unload() was a no-op - none of the sampled "
+              "q_proj slices changed. Adapter keys likely don't match the base "
+              "module tree (see eval_peft_direct.py's _patch_adapter_dir).", flush=True)
+        raise SystemExit(4)
+    print(f"[merge] no-op-merge check passed: {_n_changed}/{len(_pre_snap)} sampled "
+          f"q_proj slices changed, all finite", flush=True)
 
     # Sanity check: confirm the merge actually changed weights (a no-op merge
     # would silently ship the unmodified base under a new name).
@@ -110,12 +174,15 @@ def main():
     with open(os.path.join(MERGED_DIR, "README.md"), "w") as f:
         f.write(MODEL_CARD)
 
+    # Push straight from the already-serialized MERGED_DIR instead of
+    # model.push_to_hub()/tok.push_to_hub(), which would each re-run
+    # save_pretrained() into a fresh system-temp dir (a second ~70GB
+    # serialization pass, off SeXternal/HF_HOME, before uploading).
     _pub = os.environ.get("PUBLISH_PUBLIC", "0") == "1"
-    m.push_to_hub(MERGED_REPO, private=not _pub, token=TOKEN)
-    tok.push_to_hub(MERGED_REPO, private=not _pub, token=TOKEN)
-    from huggingface_hub import upload_file
-    upload_file(path_or_fileobj=os.path.join(MERGED_DIR, "README.md"), path_in_repo="README.md",
-                repo_id=MERGED_REPO, repo_type="model", token=TOKEN)
+    from huggingface_hub import create_repo, upload_folder
+    create_repo(MERGED_REPO, private=not _pub, exist_ok=True, token=TOKEN)
+    upload_folder(folder_path=MERGED_DIR, repo_id=MERGED_REPO, token=TOKEN,
+                   commit_message="Merge HAWQ-SEC-RE-lora-v3 into HAWQ-v1")
     print("MERGE_PUSHED")
 
 
