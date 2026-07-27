@@ -53,7 +53,7 @@ tok = AutoTokenizer.from_pretrained(base_repo)
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
 
-_kw = dict(dtype=torch.bfloat16, device_map="cuda", low_cpu_mem_usage=True)
+_kw = dict(dtype=torch.bfloat16, device_map="auto", low_cpu_mem_usage=True)
 
 # HAWQ base (lancejames221b/HAWQ, a DARE-TIES merge) has malformed checkpoint
 # keys: they are prefixed `language_model.model.*` and `language_model.lm_head`,
@@ -163,6 +163,17 @@ if _missing:
           f"even after remap. Weights are randomly initialized; eval would be "
           f"meaningless. Sample missing: {list(_missing)[:5]}", flush=True)
     sys.exit(2)
+
+# Guard: device_map="auto" can silently offload layers to CPU/disk instead
+# of OOMing if the model doesn't fit across visible GPUs. That would turn
+# generation into an effectively-hung run while the VM keeps billing, not
+# a clean failure. Fail fast instead.
+_dev_map = getattr(model, "hf_device_map", None)
+print(f"[eval] hf_device_map: {_dev_map}", flush=True)
+if _dev_map and any(str(d) in ("cpu", "disk") for d in _dev_map.values()):
+    print(f"[eval] FATAL: model partially offloaded to cpu/disk "
+          f"(insufficient GPU memory for device_map=auto): {_dev_map}", flush=True)
+    sys.exit(5)
 
 def _patch_adapter_dir(src_dir):
     """The adapter was trained against a base whose module tree has a
