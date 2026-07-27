@@ -195,6 +195,14 @@ if not no_adapter:
     with _warnings.catch_warnings(record=True) as _caught:
         _warnings.simplefilter("always")
         model = PeftModel.from_pretrained(model, patched_dir)
+    from safetensors import safe_open
+    with safe_open(os.path.join(patched_dir, "adapter_model.safetensors"), framework="pt") as _f:
+        _n_file = len(list(_f.keys()))
+    _n_bound = sum(1 for n, _ in model.named_parameters() if "lora_" in n)
+    print(f"[eval] adapter binding: {_n_bound} lora params bound / {_n_file} tensors in file", flush=True)
+    if _n_bound == 0 or _n_bound != _n_file:
+        print(f"[eval] FATAL: adapter binding mismatch ({_n_bound} != {_n_file}) - LoRA not (fully) applied", flush=True)
+        sys.exit(3)
     _missing_warnings = [str(w.message) for w in _caught
                           if "missing adapter keys" in str(w.message).lower()]
     if _missing_warnings:
