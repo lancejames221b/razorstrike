@@ -131,9 +131,97 @@ def main():
     ap.add_argument("--tuned-url", default=os.environ.get("TUNED_URL", "http://generic:1234/v1"))
     ap.add_argument("--tuned-model", default=os.environ.get("TUNED_MODEL", "hawq-sec-re"))
     ap.add_argument("--out", default="eval_re_results.json")
+    ap.add_argument("--only-side", choices=["base", "tuned"], default=None,
+                     help="two-pass mode (VRAM fallback when base+tuned can't be "
+                          "resident on the GPU simultaneously): generate analyses "
+                          "for ONLY this side and write them to --out as jsonl "
+                          "({idx, asm, code, analysis} per line). No judging.")
+    ap.add_argument("--judge-from", nargs=2, metavar=("BASE_JSONL", "TUNED_JSONL"),
+                     default=None,
+                     help="two-pass mode step 2: skip generation, load the two "
+                          "--only-side output files, and run the judge pass over "
+                          "them - identical prompts/temperature/gate as the "
+                          "single-pass path.")
     args = ap.parse_args()
 
     frontier_url, frontier_model, frontier_key = _frontier_env()
+
+    if args.only_side:
+        with open(args.tasks) as f:
+            tasks = [json.loads(line) for line in f if line.strip()]
+        print(f"[eval] two-pass generate: side={args.only_side}, {len(tasks)} tasks from {args.tasks}")
+        url = args.base_url if args.only_side == "base" else args.tuned_url
+        model = args.base_model if args.only_side == "base" else args.tuned_model
+        print(f"[eval] {args.only_side}: {model} @ {url}")
+        with open(args.out, "w") as f:
+            for i, task in enumerate(tasks):
+                try:
+                    analysis = get_analysis(url, model, task["asm"])
+                except Exception as e:
+                    print(f"[{i}] generation FAILED: {type(e).__name__}: {e}")
+                    continue
+                f.write(json.dumps({"idx": i, "asm": task["asm"], "code": task["code"],
+                                     "analysis": analysis}) + "\n")
+                print(f"[{i}] generated ({len(analysis)} chars)")
+        print(f"[eval] wrote {args.out}")
+        return 0
+
+    if args.judge_from:
+        base_path, tuned_path = args.judge_from
+        with open(base_path) as f:
+            base_rows = {r["idx"]: r for r in (json.loads(line) for line in f if line.strip())}
+        with open(tuned_path) as f:
+            tuned_rows = {r["idx"]: r for r in (json.loads(line) for line in f if line.strip())}
+        common = sorted(set(base_rows) & set(tuned_rows))
+        print(f"[eval] two-pass judge: {len(common)} tasks common to both sides "
+              f"({len(base_rows)} base, {len(tuned_rows)} tuned)")
+        print(f"[eval] judge: {frontier_model} @ {frontier_url}")
+
+        random.seed(1337)
+        results = []
+        wins = losses = ties = errors = 0
+        for i in common:
+            base_row, tuned_row = base_rows[i], tuned_rows[i]
+            asm, code = base_row["asm"], base_row["code"]
+            base_analysis, tuned_analysis = base_row["analysis"], tuned_row["analysis"]
+
+            tuned_is_a = random.random() < 0.5
+            a_text, b_text = (tuned_analysis, base_analysis) if tuned_is_a else (base_analysis, tuned_analysis)
+            try:
+                verdict, reason = judge(frontier_url, frontier_model, frontier_key, asm, code, a_text, b_text)
+            except Exception as e:
+                print(f"[{i}] judge FAILED: {type(e).__name__}: {e}")
+                errors += 1
+                continue
+
+            if verdict == "tie":
+                outcome = "tie"
+                ties += 1
+            else:
+                tuned_won = (verdict == "A") == tuned_is_a
+                outcome = "tuned_win" if tuned_won else "tuned_loss"
+                wins += 1 if tuned_won else 0
+                losses += 0 if tuned_won else 1
+
+            results.append({"idx": i, "outcome": outcome, "verdict": verdict, "reason": reason,
+                             "tuned_is_a": tuned_is_a})
+            print(f"[{i}] {outcome} ({reason[:80]})")
+
+        decided = wins + losses
+        win_rate = wins / decided if decided else 0.0
+        passed = win_rate > 0.55
+        summary = {
+            "n_tasks": len(common), "wins": wins, "losses": losses, "ties": ties,
+            "errors": errors, "win_rate": win_rate, "gate": 0.55, "pass": passed,
+            "results": results,
+        }
+        with open(args.out, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"\n[eval] wins={wins} losses={losses} ties={ties} errors={errors}")
+        print(f"[eval] tuned win-rate (excl. ties): {win_rate:.3f} "
+              f"-> {'PASS' if passed else 'FAIL'} (gate > 0.55)")
+        print(f"[eval] results written to {args.out}")
+        return 0 if passed else 1
 
     if args.from_json:
         with open(args.from_json) as f:
