@@ -38,8 +38,8 @@ be memorized by the base model's pretraining) vs humaneval/mbpp would flag
 memorization rather than decompilation skill.
 
 Usage:
-    python3 scripts/eval_decompile_bench.py --split humaneval --model hawq-sec-re-v3
-    python3 scripts/eval_decompile_bench.py --split all --model hawq-sec-re-v3 \
+    python3 scripts/eval_decompile_bench.py --split humaneval --model hawq-sec-re-v1
+    python3 scripts/eval_decompile_bench.py --split all --model hawq-sec-re-v1 \
         --host localhost:1235 --out /tmp/decompile_bench_results.json
 
 Run this ON generic (gcc 13.3.0 + Docker confirmed present there).
@@ -303,7 +303,7 @@ def stratified_sample(rows, n, seed=42):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="localhost:1235")
-    ap.add_argument("--model", default="hawq-sec-re-v3")
+    ap.add_argument("--model", default="hawq-sec-re-v1")
     ap.add_argument("--split", choices=["humaneval", "mbpp", "github", "all"], default="all")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=10)

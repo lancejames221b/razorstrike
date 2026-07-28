@@ -1,11 +1,14 @@
 # RazorStrike-v1
 
-Merge scripts, diagnostic tooling, and build manifest for **RazorStrike-v1** — a DARE-TIES task-arithmetic merge on the Qwen3.6-35B-A3B MoE base, published on HuggingFace:
+Merge scripts, diagnostic tooling, and build manifest for **RazorStrike-v1** — a DARE-TIES task-arithmetic merge on the Qwen3.6-35B-A3B MoE base.
 
-- **MLX (4-bit, Apple Silicon)**: [lancejames221b/razorstrike-v1](https://huggingface.co/lancejames221b/razorstrike-v1)
-- **GGUF (Q4_K_M, llama.cpp/Ollama)**: [lancejames221b/razorstrike-v1-GGUF](https://huggingface.co/lancejames221b/razorstrike-v1-GGUF)
-
-This repo does **not** contain model weights — see the HuggingFace links above for those. It contains the build pipeline: the merge scripts, the diagnostic scripts used to root-cause and fix a coherence defect during development, and the full build manifest.
+**Not currently published on HuggingFace.** The public repos
+(`lancejames221b/razorstrike-v1`, `razorstrike-v1-GGUF`, `razorstrike-v1-bf16`)
+were retired to consolidate the account around the active `hawq-sec-re-v1`
+release. This repo does **not** contain model weights; it contains the
+build pipeline: the merge scripts, the diagnostic scripts used to
+root-cause and fix a coherence defect during development, and the full
+build manifest — kept for reproducibility.
 
 ## Composition
 
