@@ -54,7 +54,7 @@ JUDGE_USER_TMPL = (
 )
 
 
-def _post(base_url, model, messages, api_key=None, max_tokens=4000, temperature=0.3,
+def _post(base_url, model, messages, api_key=None, max_tokens=10000, temperature=0.3,
            reasoning_effort=None):
     url = f"{base_url.rstrip('/')}/chat/completions"
     body = {"model": model, "messages": messages, "temperature": temperature,
