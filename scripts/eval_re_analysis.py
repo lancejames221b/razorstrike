@@ -65,7 +65,7 @@ def _post(base_url, model, messages, api_key=None, max_tokens=10000, temperature
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=180) as r:
+    with urllib.request.urlopen(req, timeout=600) as r:
         d = json.load(r)
     msg = d["choices"][0]["message"]
     # Local thinking-mode models (Qwen-style <think> blocks, per
