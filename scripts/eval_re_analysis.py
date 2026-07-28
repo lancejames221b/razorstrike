@@ -54,7 +54,7 @@ JUDGE_USER_TMPL = (
 )
 
 
-def _post(base_url, model, messages, api_key=None, max_tokens=1800, temperature=0.3,
+def _post(base_url, model, messages, api_key=None, max_tokens=4000, temperature=0.3,
            reasoning_effort=None):
     url = f"{base_url.rstrip('/')}/chat/completions"
     body = {"model": model, "messages": messages, "temperature": temperature,
@@ -65,9 +65,21 @@ def _post(base_url, model, messages, api_key=None, max_tokens=1800, temperature=
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=90) as r:
+    with urllib.request.urlopen(req, timeout=180) as r:
         d = json.load(r)
-    return d["choices"][0]["message"]["content"].strip()
+    msg = d["choices"][0]["message"]
+    # Local thinking-mode models (Qwen-style <think> blocks, per
+    # eval_re_v2_http_probes.py precedent) put the response in
+    # reasoning_content separately from content, and can leave content
+    # empty if the completion is cut off mid-thought (finish_reason=
+    # "length") before reaching the final answer. Fall back to
+    # reasoning_content so a truncated-but-substantive response isn't
+    # silently treated as empty - applied identically for base and tuned
+    # so the A/B stays fair.
+    content = (msg.get("content") or "").strip()
+    if not content:
+        content = (msg.get("reasoning_content") or "").strip()
+    return content
 
 
 def get_analysis(base_url, model, asm, api_key=None):
