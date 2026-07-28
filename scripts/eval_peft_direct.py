@@ -19,14 +19,14 @@ Harness fixed per HAWQ validation eval plan:
     merge-damage vs LoRA-damage).
 
 Usage:
-  python3 scripts/eval_peft_direct.py --adapter-dir /content/adapter --base lancejames221b/HAWQ
-  python3 scripts/eval_peft_direct.py --no-adapter --base lancejames221b/HAWQ
+  python3 scripts/eval_peft_direct.py --adapter-dir /content/adapter --base lancejames221b/HAWQ-v1
+  python3 scripts/eval_peft_direct.py --no-adapter --base lancejames221b/HAWQ-v1
 """
 
 import os, sys, json, time, re, collections
 
 adapter_dir = "/content/adapter/last-checkpoint"
-base_repo = "lancejames221b/HAWQ"
+base_repo = "lancejames221b/HAWQ-v1"
 no_adapter = False
 
 for i, arg in enumerate(sys.argv):
@@ -55,16 +55,22 @@ if tok.pad_token is None:
 
 _kw = dict(dtype=torch.bfloat16, device_map="auto", low_cpu_mem_usage=True)
 
-# HAWQ base (lancejames221b/HAWQ, a DARE-TIES merge) has malformed checkpoint
-# keys: they are prefixed `language_model.model.*` and `language_model.lm_head`,
-# but Qwen3_5MoeForCausalLM expects `model.*` / `lm_head.*`. The original
-# Qwen/Qwen3.6-35B-A3B base has keys `model.language_model.*` (correct for the
-# ConditionalGeneration wrapper). Neither load class matches HAWQ's keys as-is,
-# so from_pretrained loads with ~693 MISSING keys (random init -> garbage).
-# Fix: load with CausalLM, check missing_keys via output_loading_info (the real
-# list - transformers logs to stderr, NOT capturable via redirect_stdout), and
-# if MISSING keys are present, reload by manually remapping the state dict
-# (strip the leading `language_model.` prefix from every checkpoint key).
+# lancejames221b/HAWQ-v1 (the current default) already has the correct
+# checkpoint keys (`model.*` / `lm_head.*`, matching what
+# Qwen3_5MoeForCausalLM expects directly - no missing keys on load).
+#
+# The remap fallback below is legacy/defensive compat: the ORIGINAL
+# `lancejames221b/HAWQ` (a since-deleted DARE-TIES merge, a different
+# repo/lineage than HAWQ-v1) had malformed checkpoint keys prefixed
+# `language_model.model.*` / `language_model.lm_head` instead. Neither
+# load class matched those keys as-is, so from_pretrained loaded with
+# ~693 MISSING keys (random init -> garbage) unless remapped. Fix: load
+# with CausalLM, check missing_keys via output_loading_info (the real
+# list - transformers logs to stderr, NOT capturable via redirect_stdout),
+# and if MISSING keys are present, reload by manually remapping the
+# state dict (strip the leading `language_model.` prefix from every
+# checkpoint key). Kept as a no-op safety net for any future base repo
+# that reintroduces this key shape - it never fires against HAWQ-v1.
 def _load_base(repo):
     """Load base with CausalLM-first, return (model, missing, unexpected)."""
     try:
