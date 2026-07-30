@@ -94,6 +94,17 @@ DPO_DATA_GCS="${DPO_DATA_GCS:-}"
 # ValueError at import, killing every rank instantly.
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-1024}"
 REF_LOGPROBS_PREPASS="${REF_LOGPROBS_PREPASS:-0}"
+# Empty-string-safe (no int() parsing on the Python side) - threaded so a
+# preemptible run's resume-from-GCS-checkpoint path actually fires; it was
+# silently never wired to either launch branch before this.
+RESUME="${RESUME:-}"
+# FSDP backward-prefetch strategy: BACKWARD_PRE (default, faster - keeps
+# the NEXT layer's unsharded params resident during current backward) vs
+# BACKWARD_POST (holds one fewer layer's full params at peak, real memory
+# margin at some speed cost). Exposed here since DPO's two-policy-graph
+# retention pattern runs measurably closer to the memory ceiling than the
+# single-graph SFT workload this default was tuned for.
+FSDP_BACKWARD_PREFETCH="${FSDP_BACKWARD_PREFETCH:-BACKWARD_PRE}"
 if [ "$FSDP" = "1" ] && [ $((GRAD_ACCUM * GPU_COUNT)) -ne 16 ]; then
   echo "[gce] ERROR: FSDP=1 requires GRAD_ACCUM * GPU_COUNT == 16 (global effective batch, matches the tuned LR/schedule). Got GRAD_ACCUM=$GRAD_ACCUM * GPU_COUNT=$GPU_COUNT = $((GRAD_ACCUM * GPU_COUNT))." >&2
   exit 1
@@ -272,6 +283,7 @@ QLORA_4BIT=0 GRAD_ACCUM=$GRAD_ACCUM \\
 SMOKE_LONGEST_N=$SMOKE_LONGEST_N \\
 GCS_KEY_FILE=/content/gcs-key.json GCS_PROJECT='$PROJECT' \\
 DPO_DATA_GCS='$DPO_DATA_GCS' MAX_PROMPT_LEN='$MAX_PROMPT_LEN' REF_LOGPROBS_PREPASS='$REF_LOGPROBS_PREPASS' \\
+RESUME='$RESUME' \\
 PYTHONUNBUFFERED=1 \\
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
 nohup python3 -m accelerate.commands.launch \\
@@ -285,7 +297,7 @@ nohup python3 -m accelerate.commands.launch \\
   --fsdp_cpu_ram_efficient_loading true \\
   --fsdp_sync_module_states true \\
   --fsdp_state_dict_type SHARDED_STATE_DICT \\
-  --fsdp_backward_prefetch BACKWARD_PRE \\
+  --fsdp_backward_prefetch $FSDP_BACKWARD_PREFETCH \\
   -m $TRAIN_MODULE > /content/train.log 2>&1 &
 disown
 sleep 3
@@ -309,7 +321,7 @@ MAXLEN=$MAXLEN LORA_R=$LORA_R LORA_ALPHA=$LORA_ALPHA \
 TARGET_MLP=0 SAVE_STEPS=$SAVE_STEPS EVAL_STEPS=$EVAL_STEPS MAX_STEPS=${MAX_STEPS:--1} FORCE_CAUSAL_LM=1 \
 QLORA_4BIT=0 DEVICE_MAP=auto MAX_MEMORY_GIB=$MAX_MEMORY_GIB GRAD_ACCUM=$GRAD_ACCUM \
 CKPT_GCS='$CKPT_GCS' GCS_KEY_FILE=/content/gcs-key.json GCS_PROJECT='$PROJECT' \
-DPO_DATA_GCS='$DPO_DATA_GCS' \
+DPO_DATA_GCS='$DPO_DATA_GCS' MAX_PROMPT_LEN='$MAX_PROMPT_LEN' REF_LOGPROBS_PREPASS='$REF_LOGPROBS_PREPASS' RESUME='$RESUME' \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 nohup python3 -u -m $TRAIN_MODULE > /content/train.log 2>&1 &
 sleep 5
