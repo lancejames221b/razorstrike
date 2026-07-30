@@ -1,0 +1,143 @@
+HAWQ-SEC-RE release pipeline checklist
+=======================================
+Follow this in order on every new training/upgrade cycle. Written after the
+v1->v1.1 crypto/exploit-finding release (2026-07-30) to stop re-discovering
+the same gotchas each time.
+
+0. NAMING - confirm before doing anything
+   - Ask/confirm: is this an IN-PLACE update to an existing public repo
+     (keep the same link, changelog it as vX.Y), or a genuinely new
+     versioned repo? Don't assume "new training run = new repo number."
+   - lancejames221b/hawq-sec-re-v1 (public) is the real serving repo.
+   - lancejames221b/HAWQ-v1 (private) is just the base merge, NOT what
+     users pull. Never confuse the two.
+   - If updating in place: tag the pre-update HF commit (e.g. v1.0) via
+     the HF API BEFORE pushing new weights, so pinned users are safe.
+
+1. TRAIN (GCE)
+   - Shape: 4x A100 FSDP=1 (a2-highgpu-4g). The 2x A100 FSDP=0
+     pipeline-parallel fallback OOMs in the Triton FLA autotuner on this
+     MoE arch - do not use it (see hawq-gce-gpu-shape-selection skill).
+   - MAXLEN=2048 is the confirmed-stable value on this arch/shape.
+     MAXLEN=3072 (the Colab 96GB-card number) OOMs on 2x40GB A100s during
+     backward - always re-run preflight_v4_maxlen.py at the target MAXLEN
+     before committing a multi-hour run, don't reuse a number from a
+     different card/shape.
+   - Use gce_cluster_train.sh's `create`, and if a run needs to survive a
+     torn-down/recreated VM, `resume` (bootstrap detects a running VM and
+     skips create). GCS-staged base model is the fast path (in-region
+     rsync, ~1-2GB/s) - HF download is the slow fallback.
+   - Zone/capacity: sweep us-central1-{a,b,c,f}, us-east1-b if the first
+     zone lacks a2-highgpu-4g capacity. us-central1-b had 4x A100 quota
+     when us-central1-c only had 2x.
+
+2. MERGE (on the same GCE VM, before teardown)
+   - merge_push.py has a load-bearing no-op-merge check (samples q_proj
+     slices pre/post merge, verifies they actually changed + are finite).
+     NEVER bypass this - a key-prefix mismatch silently no-ops the merge
+     and ships unmodified base weights under a new name.
+   - SKIP_HF_PUSH=1 env var (added to merge_push.py this cycle) lets you
+     save the merged model locally without the slow external HF upload -
+     use this by default, decide the actual publish path AFTER merge.
+   - GCS pushes from the VM need `gcloud auth activate-service-account
+     --key-file=/content/gcs-key.json` FIRST - the VM's default compute
+     service account does NOT have bucket permissions. train_lora.py's
+     own GCS calls do this; any ad-hoc gcloud storage command you write
+     yourself must do it too or it fails with a permission-scope error.
+   - Cost call: GCE egress is fast (used ~1GiB/s to HF in this cycle) -
+     if the target repo IS going public, push directly from the VM, not
+     later from a home connection (which would take hours for 70GB).
+     Still mirror to GCS in parallel as a fast local-pull fallback.
+   - TEAR DOWN THE VM IMMEDIATELY after merge+push confirms complete.
+     All downstream work (MLX convert, GGUF, eval prep) is Mac-local and
+     needs zero GPU. `gcloud compute instances delete <vm> --zone=<z>
+     --project=<p> --quiet` (add --async if the blocking form keeps
+     hitting your command timeout).
+
+3. FIX model_type BEFORE MLX CONVERT
+   - The downloaded/merged HF checkpoint has "model_type":
+     "qwen3_5_moe_text" (text-only extraction). mlx_lm does NOT recognize
+     this - it needs "qwen3_5_moe".
+   - NEVER edit config.json in your only local copy of the published
+     artifact. Clone it first (same-volume APFS clone via `cp -c -R` is
+     near-instant/near-zero-space), patch model_type in the CLONE, point
+     HF_PATH at the clone.
+
+4. MLX CONVERT
+   - Use /Volumes/SeXternal/mlx_venv/bin/python3 - the system python3 on
+     this Mac does NOT have mlx/mlx_lm installed. Check with
+     `python3 -c "import mlx_lm"` before assuming any venv works.
+   - Run scripts/mlx_convert_cpu.py (forces mx.default_device(mx.cpu) -
+     plain mlx_lm.convert crashes with a Metal command-buffer watchdog
+     timeout on this 35B MoE model's save step, not an OOM).
+   - LAUNCH VIA `hub start`, not bare `nohup ... & disown` in a bash
+     tool call. nohup+disown alone can still die when the bash tool's own
+     shell session tears down (no setsid on macOS) - confirmed this
+     killed a conversion silently mid-run with zero traceback in this
+     cycle. hub-managed processes survive across tool calls.
+   - Expect ~45-60 min for a 65-70GB source model on this Mac. RSS climbs
+     to ~19GB and plateaus while writing shards to the external disk -
+     that's expected I/O-bound behavior (check `ps -o state=` for `U` =
+     uninterruptible/disk-wait), not a hang. Don't kill it on a flat RSS
+     reading alone; check output-file byte growth first.
+   - Output is TEXT-ONLY (vision tower dropped). If this base model has a
+     vision tower worth preserving, graft it back per the
+     qwen35moe-vision-restore-mlx-vlm-pipeline skill BEFORE calling the
+     MLX build final - don't publish a silently-degraded multimodal repo
+     as if it still has vision.
+
+5. BUILD GGUF (IQ4_XS) FOR generic'S GPU LM STUDIO
+   - hawq-sec-re-v1 ships an IQ4_XS GGUF variant for generic's GPU
+     serving IN ADDITION to the MLX build for local Apple Silicon - do
+     both, every release, don't ship MLX-only and call it done.
+   - See gguf-qwen35moe-lora-deploy-lmstudio /
+     hawq-v1-gguf-conversion-gotchas skills for the MTP block_count+1 fix
+     and tokenizer-file gotchas specific to this arch's GGUF conversion.
+
+6. EVAL GATE (before any public push)
+   - Pre-register gate criteria in a docs/*.md file BEFORE running the
+     eval that decides ship/no-ship - prevents post-hoc threshold
+     shopping. Commit it with a real timestamp.
+   - Match the k (majority-vote sample count) to whatever the baseline
+     was measured at. A k=3 run is not comparable to a k=9 baseline.
+   - Run BOTH: the new-capability probe (crypto_audit or equivalent) AND
+     the no-regression probe (eval_re_v2_http_probes.py) against the
+     actual DEPLOYED artifact (loaded in LM Studio via HTTP), not just
+     bf16 HF weights - quantization is exactly where prior regressions
+     showed up.
+   - Load the new artifact under a DISTINCT LM Studio identifier
+     (don't overwrite the currently-loaded baseline model mid-eval).
+     Verify the eval log's own header line names the correct model before
+     committing to a long sleep/wait.
+
+7. PUBLISH
+   - Confirm public visibility with an UNAUTHENTICATED request
+     (curl -s -o /dev/null -w '%{http_code}' https://huggingface.co/api/
+     models/<repo> -> 200 = truly public). create_repo(private=False,
+     exist_ok=True) does NOT flip visibility on a pre-existing repo.
+   - Write/refresh the model card BEFORE pushing - fix any hardcoded
+     stale version strings (e.g. "v3" left over from a copy-pasted
+     MODEL_CARD template) and describe the actual training-data families
+     added this cycle, not just the original ones.
+   - Push order for an in-place update: tag old commit -> push merged
+     safetensors + README -> push MLX build -> push GGUF build -> verify
+     each repo's file listing and visibility independently.
+
+8. CLEANUP
+   - Delete/deprecate any throwaway repo created before the naming
+     decision was finalized (e.g. a standalone "-v2" repo created before
+     confirming this was actually an in-place v1.x update).
+   - Confirm zero GCE instances/disks remain tagged for this run
+     (`gcloud compute instances list` / `disks list` filtered by name).
+   - Update the todo list AND write a /remember entry for any naming or
+     process decision made mid-cycle (e.g. "update in place, not a new
+     repo number") so it's not re-litigated next release.
+
+Known-good venvs / tools on this Mac (don't re-discover):
+   - MLX convert: /Volumes/SeXternal/mlx_venv/bin/python3
+   - GCE auth pattern: export CLOUDSDK_AUTH_ACCESS_TOKEN=$(gcloud auth
+     application-default print-access-token) before every gcloud call in
+     this session (no persistent gcloud login otherwise).
+   - Disk: /Volumes/Scratch has very little free space (was ~9.7GB this
+     cycle) - stage large downloads/conversions on /Volumes/SeXternal
+     instead (had 196-260GB free).
