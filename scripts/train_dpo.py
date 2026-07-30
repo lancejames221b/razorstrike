@@ -143,9 +143,19 @@ def _build_examples(raw_pairs, tok, maxlen, max_prompt_len):
             "rejected_attention_mask": rejected_feat["attention_mask"],
             "rejected_labels": rejected_feat["labels"],
         })
-    print(f"[data] built {len(examples)} usable examples "
-          f"({n_dropped_overflow} dropped for MAXLEN/MAX_PROMPT_LEN overflow)",
-          flush=True)
+    lens = sorted(max(len(e["chosen_input_ids"]), len(e["rejected_input_ids"])) for e in examples)
+    if lens:
+        p98 = lens[int(len(lens) * 0.98)]
+        print(f"[data] built {len(examples)} usable examples "
+              f"({n_dropped_overflow} dropped for MAXLEN/MAX_PROMPT_LEN overflow) "
+              f"seq_len p50={lens[len(lens)//2]} p98={p98} max={lens[-1]} "
+              f"(memory-tuning visibility: if OOM recurs, the real ceiling to "
+              f"target is p98/max, not a guessed MAXLEN)",
+              flush=True)
+    else:
+        print(f"[data] built {len(examples)} usable examples "
+              f"({n_dropped_overflow} dropped for MAXLEN/MAX_PROMPT_LEN overflow)",
+              flush=True)
     return examples
 
 
@@ -461,6 +471,15 @@ class DpoTrainer(Trainer):
                   f"reward_accuracy_last50={recent_acc:.4f} "
                   f"(n={self._rw_total})", flush=True)
 
+        # Release fragmented CUDA blocks from the four just-completed
+        # forward passes (2 retained policy graphs + 2 freed no-grad ref
+        # passes) before backward's gradient-checkpointing recomputation
+        # needs room - measured OOM margin was within 20MB on a real run,
+        # close enough that this is worth the small sync cost. Skip
+        # gc.collect() here: a full GC pass over a 35B-param object graph
+        # costs real wall-clock across hundreds of micro-steps for no
+        # extra memory return beyond what empty_cache() already gives.
+        torch.cuda.empty_cache()
         # Always return a plain scalar loss - prediction_loss_only=True
         # means Trainer never requests return_outputs=True, but returning
         # a dict here would also risk Trainer treating {"reward_accuracy":
@@ -546,6 +565,20 @@ class FsdpMemoryCleanupCallback(TrainerCallback):
     def on_evaluate(self, args, state, control, **kwargs):
         if _FSDP:
             gc.collect()
+            torch.cuda.empty_cache()
+
+    def on_substep_end(self, args, state, control, **kwargs):
+        # Fires after EACH grad-accumulation micro-step's backward (not
+        # just the full accumulated step) - the OOM observed in practice
+        # happened mid-backward on a later micro-step within one
+        # accumulation cycle, after several micro-steps had already run.
+        # compute_loss's own empty_cache() only covers the pre-backward
+        # forward-pass memory; this covers what backward itself retains
+        # (gradient buffers, checkpointing recomputation scratch). No
+        # gc.collect() here - this runs every micro-step (hundreds per
+        # run) and a full GC pass over a 35B-param object graph is real
+        # wall-clock for no extra memory return beyond empty_cache().
+        if _FSDP:
             torch.cuda.empty_cache()
 
 
