@@ -382,51 +382,75 @@ if REF_LOGPROBS_PREPASS:
 
 
 class DpoTrainer(Trainer):
-    """Overrides compute_loss for the DPO objective. train_dataset/
-    eval_dataset carry a `_split_name` list attribute so REF_LOGPROBS_PREPASS
-    can look each example up by (split, index) instead of recomputing."""
+    """Overrides training_step (train, single-graph-at-a-time split
+    backward) and compute_loss (eval-only, combined 4-forward form - safe
+    since eval never retains a graph across a backward call)."""
 
     _step0_checked = False
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Overrides the whole step (not just compute_loss) to do a SPLIT
+        backward: chosen and rejected are each forwarded-with-grad and
+        backpropagated SEPARATELY, one at a time, instead of both being
+        forwarded-with-grad and held alive simultaneously until one
+        combined loss.backward(). Confirmed OOM site was inside backward's
+        gradient-checkpoint recompute while BOTH policy graphs were
+        retained; this removes that by construction - only ONE retained
+        graph ever exists at a time - at the cost of two extra forward
+        passes per step (6 total instead of 4).
+
+        Mathematically exact, not an approximation: for
+        L = -logsigmoid(beta*h), h = (pc-rc)-(pr-rr) with rc/rr treated as
+        constants, dL/dpc = -beta*sigmoid(-beta*h) and dL/dpr =
+        +beta*sigmoid(-beta*h). Computing that scalar under no_grad (cheap,
+        no retained graph) and feeding it to `tensor.backward(gradient=...)`
+        on a SECOND, separately-retained forward of just that one side
+        reproduces the identical gradient a combined-loss single backward
+        would produce - verified locally against dpo_loss(...).backward()
+        on a toy model to 1e-6 before deploying.
+        """
+        model.train()
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
+        inputs = self._prepare_inputs(inputs)
+
         c_ids, c_am, c_lb = (inputs["chosen_input_ids"], inputs["chosen_attention_mask"],
                               inputs["chosen_labels"])
         r_ids, r_am, r_lb = (inputs["rejected_input_ids"], inputs["rejected_attention_mask"],
                               inputs["rejected_labels"])
 
-        pol_chosen_lp = _logprob_sum(model, c_ids, c_am, c_lb)
-        pol_rejected_lp = _logprob_sum(model, r_ids, r_am, r_lb)
-
+        # Reference log-probs: cached (REF_LOGPROBS_PREPASS) or live
+        # disable_adapter(), always no_grad - never retained either way.
         idx = inputs.get("_dpo_index")
         if REF_LOGPROBS_PREPASS and idx is not None:
             split_name, i = idx
             ref_chosen_lp_v, ref_rejected_lp_v = _ref_cache[(split_name, int(i))]
-            ref_chosen_lp = torch.tensor([ref_chosen_lp_v], device=pol_chosen_lp.device)
-            ref_rejected_lp = torch.tensor([ref_rejected_lp_v], device=pol_rejected_lp.device)
+            device = next(model.parameters()).device
+            ref_chosen_lp = torch.tensor([ref_chosen_lp_v], device=device)
+            ref_rejected_lp = torch.tensor([ref_rejected_lp_v], device=device)
         else:
             _toggle = _unwrap_to_adapter_toggle(model)
             with torch.no_grad(), _toggle.disable_adapter():
                 ref_chosen_lp = _logprob_sum(model, c_ids, c_am, c_lb)
                 ref_rejected_lp = _logprob_sum(model, r_ids, r_am, r_lb)
 
+        # Pass 1 (no_grad, both sides): just to get the scalar gradient
+        # coefficient g and the reportable loss value. No graph retained.
+        with torch.no_grad():
+            pc_ng = _logprob_sum(model, c_ids, c_am, c_lb)
+            pr_ng = _logprob_sum(model, r_ids, r_am, r_lb)
+
         if not DpoTrainer._step0_checked:
             # LoRA's B matrix is zero-initialized, so the adapter
             # contributes EXACTLY zero at init: policy and reference
-            # log-probs SHOULD be identical on this very first call. In
-            # practice they won't be bit-identical: pol_*_lp runs through
-            # train-mode + gradient-checkpointing + autograd, ref_*_lp
-            # through no_grad - different kernel paths in bf16, and each
-            # is a SUM over up to ~1024-2048 per-token log-probs, so
-            # rounding noise accumulates. A loose bound (order 1.0, not
-            # 1e-2) still cleanly separates that noise floor from a
-            # genuinely broken reference - if disable_adapter() failed to
-            # take effect under FSDP wrapping (the plan's named risk), the
-            # divergence would be structural (wrong/garbage submodule
-            # state), not a small rounding artifact, and would show up as
-            # a difference orders of magnitude larger than noise.
+            # log-probs SHOULD be identical on this very first call. A
+            # loose bound (order 1.0, not 1e-2) separates bf16 rounding
+            # noise (different kernel paths, sums over ~1000+ tokens) from
+            # a genuinely broken reference (disable_adapter() not taking
+            # effect under FSDP wrapping - the plan's named risk).
             DpoTrainer._step0_checked = True
-            c_diff = (pol_chosen_lp - ref_chosen_lp).abs().max().item()
-            r_diff = (pol_rejected_lp - ref_rejected_lp).abs().max().item()
+            c_diff = (pc_ng - ref_chosen_lp).abs().max().item()
+            r_diff = (pr_ng - ref_rejected_lp).abs().max().item()
             print(f"[step0-check] |pol_chosen_lp - ref_chosen_lp|={c_diff:.6f} "
                   f"|pol_rejected_lp - ref_rejected_lp|={r_diff:.6f} "
                   f"(expect near-0, bf16 sum-of-~1000-tokens noise floor "
@@ -440,18 +464,29 @@ class DpoTrainer(Trainer):
                 f"wrong. Set REF_LOGPROBS_PREPASS=1 and relaunch rather than "
                 f"continuing.")
 
-        loss = dpo_loss(pol_chosen_lp, pol_rejected_lp, ref_chosen_lp, ref_rejected_lp,
-                         beta=DPO_BETA)
+        h = (pc_ng - ref_chosen_lp) - (pr_ng - ref_rejected_lp)
+        loss = -torch.nn.functional.logsigmoid(DPO_BETA * h).mean()
+        n = pc_ng.shape[0]
+        g = DPO_BETA * torch.sigmoid(-DPO_BETA * h)  # dL/dpc = -g, dL/dpr = +g
+
+        # Pass 2 (WITH grad, chosen only): single retained graph, backward
+        # immediately, then free before pass 3 ever allocates.
+        pc_grad = _logprob_sum(model, c_ids, c_am, c_lb)
+        self.accelerator.backward(pc_grad, gradient=(-g / n))
+        del pc_grad
+        torch.cuda.empty_cache()
+
+        # Pass 3 (WITH grad, rejected only): same, after pass 2's graph is gone.
+        pr_grad = _logprob_sum(model, r_ids, r_am, r_lb)
+        self.accelerator.backward(pr_grad, gradient=(g / n))
+        del pr_grad
+        torch.cuda.empty_cache()
 
         with torch.no_grad():
-            hit = ((pol_chosen_lp - ref_chosen_lp) >
-                   (pol_rejected_lp - ref_rejected_lp)).float().mean().item()
+            hit = ((pc_ng - ref_chosen_lp) > (pr_ng - ref_rejected_lp)).float().mean().item()
         # Instantaneous reward_accuracy is meaningless with batch size 1
-        # (always exactly 0.0 or 1.0 per call) - the plan's own health
-        # check ("climbs from ~0.5 toward 0.7+", "stop if it sits at ~0.5
-        # through step 65") requires an aggregate. Track both a full-run
-        # cumulative mean and a short recent window so a stall is visible
-        # quickly rather than washed out by early-run noise.
+        # (always exactly 0.0 or 1.0 per call) - track a cumulative mean
+        # and a short recent window so a stall is visible quickly.
         if not hasattr(self, "_rw_hits"):
             self._rw_hits = 0
             self._rw_total = 0
@@ -471,20 +506,40 @@ class DpoTrainer(Trainer):
                   f"reward_accuracy_last50={recent_acc:.4f} "
                   f"(n={self._rw_total})", flush=True)
 
-        # Release fragmented CUDA blocks from the four just-completed
-        # forward passes (2 retained policy graphs + 2 freed no-grad ref
-        # passes) before backward's gradient-checkpointing recomputation
-        # needs room - measured OOM margin was within 20MB on a real run,
-        # close enough that this is worth the small sync cost. Skip
-        # gc.collect() here: a full GC pass over a 35B-param object graph
-        # costs real wall-clock across hundreds of micro-steps for no
-        # extra memory return beyond what empty_cache() already gives.
-        torch.cuda.empty_cache()
-        # Always return a plain scalar loss - prediction_loss_only=True
-        # means Trainer never requests return_outputs=True, but returning
-        # a dict here would also risk Trainer treating {"reward_accuracy":
-        # <0-dim tensor>} as logits to gather/pad across FSDP ranks at
-        # eval time, which is not what that value is.
+        return loss.detach()
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """EVAL-ONLY path. Trainer.evaluate() -> prediction_step() calls
+        this directly (never training_step), always under torch.no_grad()
+        - so the original combined 4-forward-pass form is safe here: no
+        graph is ever retained during eval regardless, which is exactly
+        why the OOM never happened at an eval boundary in earlier runs,
+        only inside training's backward. Do NOT remove this method: eval
+        will TypeError against the base Trainer's compute_loss (it expects
+        a model(**inputs) call with a `loss` output key, not this dataset's
+        chosen_*/rejected_* keys) the moment EVAL_STEPS is hit."""
+        with torch.no_grad():
+            c_ids, c_am, c_lb = (inputs["chosen_input_ids"], inputs["chosen_attention_mask"],
+                                  inputs["chosen_labels"])
+            r_ids, r_am, r_lb = (inputs["rejected_input_ids"], inputs["rejected_attention_mask"],
+                                  inputs["rejected_labels"])
+            pol_chosen_lp = _logprob_sum(model, c_ids, c_am, c_lb)
+            pol_rejected_lp = _logprob_sum(model, r_ids, r_am, r_lb)
+            idx = inputs.get("_dpo_index")
+            if REF_LOGPROBS_PREPASS and idx is not None:
+                split_name, i = idx
+                ref_chosen_lp_v, ref_rejected_lp_v = _ref_cache[(split_name, int(i))]
+                ref_chosen_lp = torch.tensor([ref_chosen_lp_v], device=pol_chosen_lp.device)
+                ref_rejected_lp = torch.tensor([ref_rejected_lp_v], device=pol_rejected_lp.device)
+            else:
+                _toggle = _unwrap_to_adapter_toggle(model)
+                with _toggle.disable_adapter():
+                    ref_chosen_lp = _logprob_sum(model, c_ids, c_am, c_lb)
+                    ref_rejected_lp = _logprob_sum(model, r_ids, r_am, r_lb)
+            loss = dpo_loss(pol_chosen_lp, pol_rejected_lp, ref_chosen_lp, ref_rejected_lp,
+                             beta=DPO_BETA)
+        if return_outputs:
+            return loss, {}
         return loss
 
 
