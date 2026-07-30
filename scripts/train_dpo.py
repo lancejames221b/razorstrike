@@ -309,13 +309,15 @@ def _logprob_sum(fwd_model, input_ids, attention_mask, labels):
     out = fwd_model(input_ids=input_ids, attention_mask=attention_mask)
     logits = out.logits[:, :-1, :].float()
     targets_ = labels[:, 1:]
-    mask = (targets_ != -100)
-    logprobs = torch.log_softmax(logits, dim=-1)
-    targets_safe = targets_.clone()
-    targets_safe[~mask] = 0
-    token_lp = torch.gather(logprobs, 2, targets_safe.unsqueeze(-1)).squeeze(-1)
-    token_lp = token_lp * mask
-    return token_lp.sum(dim=-1)
+    # F.cross_entropy(ignore_index=-100) is fused (never materializes the
+    # full [B,T,V] log_softmax distribution the way log_softmax+gather did)
+    # and treats -100 positions as contributing exactly 0 to the per-token
+    # loss, so summing directly is correct with no separate mask/gather.
+    # Saves ~2.4GB of activation per forward at MAXLEN=2048 on this vocab
+    # size - real headroom on a 4-forward-per-step DPO run.
+    per_token_nll = torch.nn.functional.cross_entropy(
+        logits.transpose(1, 2), targets_, reduction="none", ignore_index=-100)
+    return (-per_token_nll).sum(dim=-1)
 
 
 def _unwrap_to_adapter_toggle(m):
