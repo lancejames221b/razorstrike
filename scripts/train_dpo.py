@@ -316,7 +316,8 @@ def _logprob_sum(fwd_model, input_ids, attention_mask, labels):
     # Saves ~2.4GB of activation per forward at MAXLEN=2048 on this vocab
     # size - real headroom on a 4-forward-per-step DPO run.
     per_token_nll = torch.nn.functional.cross_entropy(
-        logits.transpose(1, 2), targets_, reduction="none", ignore_index=-100)
+        logits.reshape(-1, logits.size(-1)), targets_.reshape(-1),
+        reduction="none", ignore_index=-100).view(targets_.shape)
     return (-per_token_nll).sum(dim=-1)
 
 
