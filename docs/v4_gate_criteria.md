@@ -60,3 +60,4 @@ k=3 PASS.
 
 This file is the pre-committed reference for the final report; the actual Step 6 run
 either satisfies it or explicitly deviates with justification, not the reverse.
+Official k=9 baseline (crypto-baseline-k9d, 2026-07-30 04:09-04:39 UTC): overall PASS, crypto_id 4/5 (AES/SHA-256/MD5/TEA pass, Blowfish fail), misuse_enum PASS, clean_control PASS, exploit_path PASS
