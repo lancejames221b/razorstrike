@@ -252,19 +252,24 @@ echo "[launch] at commit: \$(git log -1 --format='%H %s')"
 # Robust teardown before relaunch: pkill alone + a fixed sleep is not
 # enough to reclaim GPU memory from a process holding tens of GB - poll
 # until the process is actually gone, then verify every GPU is near-0 MiB
-# before handing off to FSDP. Bracket trick ([t]rain_lora) so the pattern
+# before handing off to FSDP. Bracket trick ([x]name) so the pattern
 # doesn't match this very shell's own cmdline (confirmed self-match bug:
 # an inline SSH --command containing the literal pattern text kills its
 # own remote shell and gcloud reports exit 255, misread as connectivity
-# flakiness rather than the self-inflicted kill it actually is).
-pkill -f "[t]rain_lora" 2>/dev/null || true
+# flakiness rather than the self-inflicted kill it actually is). Must
+# key off \$TRAIN_MODULE, not a hardcoded script name - a crashed
+# train_dpo/accelerate rank otherwise survives every relaunch attempt.
+_kill_pat="${TRAIN_MODULE##*.}"
+pkill -f "[\${_kill_pat:0:1}]\${_kill_pat:1}" 2>/dev/null || true
+pkill -f "[a]ccelerate" 2>/dev/null || true
 for i in \$(seq 1 30); do
-  pgrep -f "[t]rain_lora" >/dev/null || break
+  pgrep -f "[\${_kill_pat:0:1}]\${_kill_pat:1}" >/dev/null || pgrep -f "[a]ccelerate" >/dev/null || break
   sleep 2
 done
-if pgrep -f "[t]rain_lora" >/dev/null; then
-  echo "[launch] WARNING: train_lora process still alive after 60s, force-killing"
-  pkill -9 -f "[t]rain_lora" 2>/dev/null || true
+if pgrep -f "[\${_kill_pat:0:1}]\${_kill_pat:1}" >/dev/null || pgrep -f "[a]ccelerate" >/dev/null; then
+  echo "[launch] WARNING: prior training process still alive after 60s, force-killing"
+  pkill -9 -f "[\${_kill_pat:0:1}]\${_kill_pat:1}" 2>/dev/null || true
+  pkill -9 -f "[a]ccelerate" 2>/dev/null || true
   sleep 3
 fi
 echo "[launch] GPU memory before FSDP launch:"
