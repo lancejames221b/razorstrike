@@ -53,7 +53,7 @@ x86-64 assembly (purpose, I/O, algorithm, security-relevant behavior).
   linear-attention/SSM MoE architecture, 256 experts, text-only CausalLM)
 - Method: LoRA SFT via `transformers` + `peft`, response-only prompt-prefix
   masking (no TRL, avoiding a v5-transformers compatibility risk)
-- Data: `hawq-re-v3` - RE-analysis + decompile families from
+- Data: `hawq-re-v4` + omp-advisory/clean-control DPO (v1.1) - RE-analysis + decompile families from
   LLM4Binary/decompile-bench with frontier-generated gold analyses
 - 4x A100 FSDP, 2 epochs, MAXLEN=4096, r=64/alpha=128, attention+SSM target
   modules
@@ -186,7 +186,7 @@ def main():
         from huggingface_hub import create_repo, upload_folder
         create_repo(MERGED_REPO, private=not _pub, exist_ok=True, token=TOKEN)
         upload_folder(folder_path=MERGED_DIR, repo_id=MERGED_REPO, token=TOKEN,
-                       commit_message="Merge HAWQ-SEC-RE-lora-v3 into HAWQ-v1")
+                       commit_message="Merge HAWQ-SEC-RE adapter into HAWQ-v1")
     print("MERGE_PUSHED")
 
 

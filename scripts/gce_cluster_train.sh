@@ -79,6 +79,14 @@ SAVE_STEPS="${SAVE_STEPS:-250}"
 EVAL_STEPS="${EVAL_STEPS:-250}"
 MAX_STEPS="${MAX_STEPS:--1}"
 SMOKE_LONGEST_N="${SMOKE_LONGEST_N:-0}"
+# Selects the training entrypoint module: scripts.train_lora (SFT, default)
+# or scripts.train_dpo (HAWQ v1.1 DPO pass). Substituted at both FSDP and
+# non-FSDP launch sites below - never fork this script per-entrypoint.
+TRAIN_MODULE="${TRAIN_MODULE:-scripts.train_lora}"
+# GCS path to the combined DPO pairs JSONL (scripts/train_dpo.py reads this
+# directly; DATA_REPO is still required below by the pre-existing gate but
+# train_dpo.py never reads it - only train_lora.py's SFT path does).
+DPO_DATA_GCS="${DPO_DATA_GCS:-}"
 if [ "$FSDP" = "1" ] && [ $((GRAD_ACCUM * GPU_COUNT)) -ne 16 ]; then
   echo "[gce] ERROR: FSDP=1 requires GRAD_ACCUM * GPU_COUNT == 16 (global effective batch, matches the tuned LR/schedule). Got GRAD_ACCUM=$GRAD_ACCUM * GPU_COUNT=$GPU_COUNT = $((GRAD_ACCUM * GPU_COUNT))." >&2
   exit 1
@@ -116,23 +124,7 @@ _ssh() {
   done
   return 1
 }
-
-cmd="${1:-}"
-
-case "$cmd" in
-  create)
-    echo "[gce] creating $VM_NAME ($GPU_COUNT x $GPU_TYPE, $MACHINE_TYPE, zone=$ZONE, preemptible=$PREEMPTIBLE)"
-    extra_flags=()
-    if [ "$PREEMPTIBLE" = "1" ]; then extra_flags+=(--preemptible); fi
-    _gcloud compute instances create "$VM_NAME" \
-      --project="$PROJECT" --zone="$ZONE" \
-      --machine-type="$MACHINE_TYPE" \
-      --accelerator="type=$GPU_TYPE,count=$GPU_COUNT" \
-      --image-family="$IMAGE_FAMILY" --image-project="$IMAGE_PROJECT" \
-      --boot-disk-size="$BOOT_DISK_SIZE" --boot-disk-type=pd-ssd \
-      --maintenance-policy=TERMINATE --restart-on-failure \
-      "${extra_flags[@]}"
-
+_bootstrap_and_launch() {
     echo "[gce] waiting for SSH..."
     for i in $(seq 1 30); do
       if _ssh "echo ssh_ready" 2>/dev/null | grep -q ssh_ready; then break; fi
@@ -163,26 +155,68 @@ case "$cmd" in
     # none is staged. Either way, this happens ONCE before torchrun spins
     # up N ranks - N-1 GPUs would otherwise idle through hf_hub's download
     # lock serializing the fetch across all N processes.
+    #
+    # Run DETACHED on the VM (nohup + background, sentinel file for
+    # completion) rather than as one long blocking foreground SSH call -
+    # confirmed empirically this session: a ~70GB rsync tied to a single
+    # SSH/IAP session dies on tunnel drop (`[/usr/bin/ssh] exited with
+    # return code [255]`) and the whole bootstrap fails, even though the
+    # VM itself stayed healthy throughout. Detaching means a dropped
+    # tunnel only loses the POLL, not the transfer in progress.
     BASE_MODEL_GCS="${BASE_MODEL_GCS:-gs://hawq-training-us-central1/models/HAWQ-v1}"
     echo "[gce] staging base model (GCS-staged preferred: $BASE_MODEL_GCS)"
-    _stage_out="$(_ssh "cd /content/razorstrike && _gcs_ok=0
-if gcloud storage ls '$BASE_MODEL_GCS' >/dev/null 2>&1; then
+    _stage_local=$(mktemp)
+    cat > "$_stage_local" <<STAGESCRIPT
+#!/bin/bash
+cd /content/razorstrike
+rm -f /content/stage_done.txt
+_gcs_ok=0
+if gcloud storage ls "$BASE_MODEL_GCS" >/dev/null 2>&1; then
   mkdir -p /content/base_model
-  gcloud storage rsync -r --no-ignore-symlinks '$BASE_MODEL_GCS' /content/base_model && _gcs_ok=1
+  gcloud storage rsync -r --no-ignore-symlinks "$BASE_MODEL_GCS" /content/base_model && _gcs_ok=1
 fi
-if [ \"\$_gcs_ok\" = 1 ]; then
-  echo 'BASE_MODEL_SOURCE=gcs:/content/base_model'
+if [ "\$_gcs_ok" = 1 ]; then
+  echo "BASE_MODEL_SOURCE=gcs:/content/base_model" > /content/stage_done.txt
 else
-  HF_HOME=/content/hf_home HF_TOKEN='$HF_TOKEN' python3 -u -c \"
+  HF_HOME=/content/hf_home HF_TOKEN='$HF_TOKEN' python3 -u -c "
 from huggingface_hub import snapshot_download
 p = snapshot_download(repo_id='lancejames221b/HAWQ-v1', token='$HF_TOKEN')
 print('BASE_MODEL_SOURCE=hf:' + p)
-\"
-fi")"
-    echo "$_stage_out" | tail -20
-    _base_repo_resolved="$(echo "$_stage_out" | grep -oE 'BASE_MODEL_SOURCE=(gcs|hf):.*' | tail -1 | sed -E 's/BASE_MODEL_SOURCE=(gcs|hf)://')"
+" > /tmp/hf_stage_out.txt 2>&1 && grep -oE 'BASE_MODEL_SOURCE=hf:.*' /tmp/hf_stage_out.txt > /content/stage_done.txt
+fi
+# Must be the LAST line: bash reads scripts incrementally, so any line
+# appended below this would be read from an already-shredded file.
+shred -u /tmp/stage_model.sh 2>/dev/null || rm -f /tmp/stage_model.sh
+STAGESCRIPT
+    _scp_iap_flag=(); if [ "$USE_IAP" = "1" ]; then _scp_iap_flag=(--tunnel-through-iap); fi
+    _gcloud compute scp "$_stage_local" "$VM_NAME:/tmp/stage_model.sh" --zone="$ZONE" --project="$PROJECT" "${_scp_iap_flag[@]}"
+    rm -f "$_stage_local"
+    # Run DETACHED on the VM (nohup + background, sentinel file for
+    # completion) rather than as one long blocking foreground SSH call -
+    # confirmed empirically this session: a ~70GB rsync tied to a single
+    # SSH/IAP session dies on tunnel drop (`[/usr/bin/ssh] exited with
+    # return code [255]`) and the whole bootstrap fails, even though the
+    # VM itself stayed healthy throughout. Detaching means a dropped
+    # tunnel only loses the POLL, not the transfer in progress.
+    _ssh "nohup bash /tmp/stage_model.sh > /content/stage.log 2>&1 & disown; sleep 2; echo STAGE_LAUNCHED"
+    echo "[gce] polling staging progress (detached on VM, survives SSH drops)..."
+    _stage_result=""
+    for i in $(seq 1 180); do
+      _poll="$(_ssh "cat /content/stage_done.txt 2>/dev/null; echo ---; tail -3 /content/stage.log 2>/dev/null" 2>/dev/null)"
+      if [ "$i" = "1" ]; then
+        echo "[gce] first poll (checking for early script errors):"
+        echo "$_poll"
+      fi
+      if echo "$_poll" | grep -q "BASE_MODEL_SOURCE="; then
+        _stage_result="$_poll"
+        break
+      fi
+      sleep 10
+    done
+    echo "$_stage_result" | tail -10
+    _base_repo_resolved="$(echo "$_stage_result" | grep -oE 'BASE_MODEL_SOURCE=(gcs|hf):.*' | head -1 | sed -E 's/BASE_MODEL_SOURCE=(gcs|hf)://')"
     if [ -z "$_base_repo_resolved" ]; then
-      echo "[gce] ERROR: could not resolve base model source (GCS stage and HF download both failed)" >&2
+      echo "[gce] ERROR: could not resolve base model source (GCS stage and HF download both failed, or polling timed out)" >&2
       exit 1
     fi
     echo "[gce] base model resolved -> $_base_repo_resolved"
@@ -230,6 +264,7 @@ TARGET_MLP=$TARGET_MLP SAVE_STEPS=$SAVE_STEPS EVAL_STEPS=$EVAL_STEPS MAX_STEPS=$
 QLORA_4BIT=0 GRAD_ACCUM=$GRAD_ACCUM \\
 SMOKE_LONGEST_N=$SMOKE_LONGEST_N \\
 GCS_KEY_FILE=/content/gcs-key.json GCS_PROJECT='$PROJECT' \\
+DPO_DATA_GCS='$DPO_DATA_GCS' \\
 PYTHONUNBUFFERED=1 \\
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
 nohup python3 -m accelerate.commands.launch \\
@@ -244,7 +279,7 @@ nohup python3 -m accelerate.commands.launch \\
   --fsdp_sync_module_states true \\
   --fsdp_state_dict_type SHARDED_STATE_DICT \\
   --fsdp_backward_prefetch BACKWARD_PRE \\
-  -m scripts.train_lora > /content/train.log 2>&1 &
+  -m $TRAIN_MODULE > /content/train.log 2>&1 &
 disown
 sleep 3
 echo LAUNCHED
@@ -256,7 +291,7 @@ FSDPLAUNCH
       _ssh "bash /tmp/fsdp_launch.sh"
     else
       echo "[gce] launching single-process bf16 pipeline (device_map=auto across $GPU_COUNT GPUs, GRAD_ACCUM=$GRAD_ACCUM)"
-      launch_cmd="cd /content/razorstrike && pkill -f train_lora 2>/dev/null; sleep 2; \
+      launch_cmd="cd /content/razorstrike && pkill -f ${TRAIN_MODULE##*.} 2>/dev/null; sleep 2; \
 HF_HOME=/content/hf_home \
 HF_TOKEN='$HF_TOKEN' \
 BASE_REPO='$_base_repo_resolved' \
@@ -264,16 +299,52 @@ DATA_REPO='$DATA_REPO' \
 ADAPTER_REPO='$ADAPTER_FULL' \
 OUT_DIR=/content/adapter \
 MAXLEN=$MAXLEN LORA_R=$LORA_R LORA_ALPHA=$LORA_ALPHA \
-TARGET_MLP=0 SAVE_STEPS=250 EVAL_STEPS=250 MAX_STEPS=${MAX_STEPS:--1} FORCE_CAUSAL_LM=1 \
+TARGET_MLP=0 SAVE_STEPS=$SAVE_STEPS EVAL_STEPS=$EVAL_STEPS MAX_STEPS=${MAX_STEPS:--1} FORCE_CAUSAL_LM=1 \
 QLORA_4BIT=0 DEVICE_MAP=auto MAX_MEMORY_GIB=$MAX_MEMORY_GIB GRAD_ACCUM=$GRAD_ACCUM \
 CKPT_GCS='$CKPT_GCS' GCS_KEY_FILE=/content/gcs-key.json GCS_PROJECT='$PROJECT' \
+DPO_DATA_GCS='$DPO_DATA_GCS' \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-nohup python3 -u -m scripts.train_lora > /content/train.log 2>&1 &
+nohup python3 -u -m $TRAIN_MODULE > /content/train.log 2>&1 &
 sleep 5
-pgrep -af train_lora || echo NOT_RUNNING"
+pgrep -af ${TRAIN_MODULE##*.} || echo NOT_RUNNING"
       _ssh "$launch_cmd"
     fi
     echo "[gce] launched. Check with: $0 status"
+}
+
+cmd="${1:-}"
+
+case "$cmd" in
+  create)
+    echo "[gce] creating $VM_NAME ($GPU_COUNT x $GPU_TYPE, $MACHINE_TYPE, zone=$ZONE, preemptible=$PREEMPTIBLE)"
+    extra_flags=()
+    if [ "$PREEMPTIBLE" = "1" ]; then extra_flags+=(--preemptible); fi
+    _gcloud compute instances create "$VM_NAME" \
+      --project="$PROJECT" --zone="$ZONE" \
+      --machine-type="$MACHINE_TYPE" \
+      --accelerator="type=$GPU_TYPE,count=$GPU_COUNT" \
+      --image-family="$IMAGE_FAMILY" --image-project="$IMAGE_PROJECT" \
+      --boot-disk-size="$BOOT_DISK_SIZE" --boot-disk-type=pd-ssd \
+      --maintenance-policy=TERMINATE --restart-on-failure \
+      "${extra_flags[@]}"
+    _bootstrap_and_launch
+    ;;
+
+  resume)
+    # Skips VM creation - reuses an ALREADY-RUNNING instance (e.g. one that
+    # was provisioned by a `create` call whose local process died/was
+    # killed after gcloud accepted the request but before bootstrap ran;
+    # gcloud's own async creation is NOT cancelled by killing the local
+    # script, so re-running `create` would just fail on "already exists"
+    # after burning through _gcloud's retry loop). Requires $VM_NAME to
+    # already be RUNNING in $ZONE.
+    echo "[gce] resuming bootstrap+launch against existing $VM_NAME (zone=$ZONE) - skipping VM creation"
+    _status="$(_gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --format='value(status)')"
+    if [ "$_status" != "RUNNING" ]; then
+      echo "[gce] ERROR: $VM_NAME is not RUNNING (status=$_status) - wait for it or use 'create' for a fresh VM" >&2
+      exit 1
+    fi
+    _bootstrap_and_launch
     ;;
 
   status)
@@ -286,7 +357,7 @@ pgrep -af train_lora || echo NOT_RUNNING"
     ;;
 
   *)
-    echo "usage: $0 {create|status|teardown}" >&2
+    echo "usage: $0 {create|resume|status|teardown}" >&2
     exit 1
     ;;
 esac
