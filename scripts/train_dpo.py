@@ -52,9 +52,9 @@ from dpo_common import (parse_prompt_to_messages, build_dpo_pair_features,
 
 BASE   = os.environ.get("BASE_REPO", "Qwen/Qwen3.6-35B-A3B")
 OUT    = os.environ.get("OUT_DIR", "/content/adapter")
-MAXLEN = int(os.environ.get("MAXLEN", "2048"))
-MAX_PROMPT_LEN = int(os.environ.get("MAX_PROMPT_LEN", "1024"))
-DPO_BETA = float(os.environ.get("DPO_BETA", "0.1"))
+MAXLEN = int(os.environ.get("MAXLEN") or 2048)
+MAX_PROMPT_LEN = int(os.environ.get("MAX_PROMPT_LEN") or 1024)
+DPO_BETA = float(os.environ.get("DPO_BETA") or 0.1)
 REF_LOGPROBS_PREPASS = os.environ.get("REF_LOGPROBS_PREPASS", "0") == "1"
 
 # GCS staging: activate the service-account key (written to disk by the

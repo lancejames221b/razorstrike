@@ -87,6 +87,13 @@ TRAIN_MODULE="${TRAIN_MODULE:-scripts.train_lora}"
 # directly; DATA_REPO is still required below by the pre-existing gate but
 # train_dpo.py never reads it - only train_lora.py's SFT path does).
 DPO_DATA_GCS="${DPO_DATA_GCS:-}"
+# DPO-only tunables, threaded through to both launch branches below.
+# MAX_PROMPT_LEN defaults to 1024 (matching train_dpo.py's own Python-side
+# default) rather than empty string - an exported empty string is NOT the
+# same as "unset" to os.environ.get() on the VM, and int("") raises
+# ValueError at import, killing every rank instantly.
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-1024}"
+REF_LOGPROBS_PREPASS="${REF_LOGPROBS_PREPASS:-0}"
 if [ "$FSDP" = "1" ] && [ $((GRAD_ACCUM * GPU_COUNT)) -ne 16 ]; then
   echo "[gce] ERROR: FSDP=1 requires GRAD_ACCUM * GPU_COUNT == 16 (global effective batch, matches the tuned LR/schedule). Got GRAD_ACCUM=$GRAD_ACCUM * GPU_COUNT=$GPU_COUNT = $((GRAD_ACCUM * GPU_COUNT))." >&2
   exit 1
@@ -264,7 +271,7 @@ TARGET_MLP=$TARGET_MLP SAVE_STEPS=$SAVE_STEPS EVAL_STEPS=$EVAL_STEPS MAX_STEPS=$
 QLORA_4BIT=0 GRAD_ACCUM=$GRAD_ACCUM \\
 SMOKE_LONGEST_N=$SMOKE_LONGEST_N \\
 GCS_KEY_FILE=/content/gcs-key.json GCS_PROJECT='$PROJECT' \\
-DPO_DATA_GCS='$DPO_DATA_GCS' \\
+DPO_DATA_GCS='$DPO_DATA_GCS' MAX_PROMPT_LEN='$MAX_PROMPT_LEN' REF_LOGPROBS_PREPASS='$REF_LOGPROBS_PREPASS' \\
 PYTHONUNBUFFERED=1 \\
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
 nohup python3 -m accelerate.commands.launch \\
