@@ -174,15 +174,19 @@ def main():
     with open(os.path.join(MERGED_DIR, "README.md"), "w") as f:
         f.write(MODEL_CARD)
 
-    # Push straight from the already-serialized MERGED_DIR instead of
-    # model.push_to_hub()/tok.push_to_hub(), which would each re-run
-    # save_pretrained() into a fresh system-temp dir (a second ~70GB
-    # serialization pass, off SeXternal/HF_HOME, before uploading).
-    _pub = os.environ.get("PUBLISH_PUBLIC", "0") == "1"
-    from huggingface_hub import create_repo, upload_folder
-    create_repo(MERGED_REPO, private=not _pub, exist_ok=True, token=TOKEN)
-    upload_folder(folder_path=MERGED_DIR, repo_id=MERGED_REPO, token=TOKEN,
-                   commit_message="Merge HAWQ-SEC-RE-lora-v3 into HAWQ-v1")
+    if os.environ.get("SKIP_HF_PUSH", "0") == "1":
+        print(f"[merge] SKIP_HF_PUSH=1, leaving merged model at {MERGED_DIR} "
+              f"(no HF upload) - push to GCS/HF separately", flush=True)
+    else:
+        # Push straight from the already-serialized MERGED_DIR instead of
+        # model.push_to_hub()/tok.push_to_hub(), which would each re-run
+        # save_pretrained() into a fresh system-temp dir (a second ~70GB
+        # serialization pass, off SeXternal/HF_HOME, before uploading).
+        _pub = os.environ.get("PUBLISH_PUBLIC", "0") == "1"
+        from huggingface_hub import create_repo, upload_folder
+        create_repo(MERGED_REPO, private=not _pub, exist_ok=True, token=TOKEN)
+        upload_folder(folder_path=MERGED_DIR, repo_id=MERGED_REPO, token=TOKEN,
+                       commit_message="Merge HAWQ-SEC-RE-lora-v3 into HAWQ-v1")
     print("MERGE_PUSHED")
 
 
