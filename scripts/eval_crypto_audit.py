@@ -54,7 +54,7 @@ K_DEFAULT = 3
 
 
 def _post(host, model, messages, max_tokens, temperature=0.0, top_p=0.95, tools=None,
-           timeout=1200, retries=8):
+           timeout=1200, retries=10):
     body = {
         "model": model,
         "messages": messages,
@@ -82,7 +82,7 @@ def _post(host, model, messages, max_tokens, temperature=0.0, top_p=0.95, tools=
             if attempt < retries:
                 print(f"    [http] transient error ({type(e).__name__}: {e}), "
                       f"retry {attempt + 1}/{retries}", flush=True)
-                time.sleep(min(2 * (attempt + 1), 30))
+                time.sleep(min(2 ** attempt, 30))
     raise last_err
 
 
