@@ -307,7 +307,11 @@ _ref_cache = {}
 
 def _logprob_sum(fwd_model, input_ids, attention_mask, labels):
     out = fwd_model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = out.logits[:, :-1, :].float()
+    logits = out.logits[:, :-1, :]  # keep bf16 - cross_entropy's CUDA kernel
+    # accumulates in fp32 internally (accscalar_t) for half/bf16 inputs, so
+    # explicitly casting here would only materialize a redundant full-size
+    # fp32 copy (~1.5GB per forward at MAXLEN=1536, retained in BOTH the
+    # chosen and rejected policy graphs simultaneously until backward).
     targets_ = labels[:, 1:]
     # F.cross_entropy(ignore_index=-100) is fused (never materializes the
     # full [B,T,V] log_softmax distribution the way log_softmax+gather did)
