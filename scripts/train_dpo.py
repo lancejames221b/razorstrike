@@ -793,6 +793,17 @@ if trainer.is_world_process_zero():
     if not _FSDP:
         trainer.save_model(OUT)
     tok.save_pretrained(OUT)
-    tok.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
+    # Informational only - Step 4 of the DPO plan merges on-VM from
+    # /content/adapter (already saved above) using BASE_REPO's tokenizer,
+    # never this pushed copy. Confirmed on-GPU: a private-storage-quota
+    # 403 here crashed rank 0 (and, via torchrun's elastic launch, every
+    # other rank with it) AFTER the real adapter save completed, so
+    # TRAINING_COMPLETE never printed despite training having actually
+    # finished. Don't let a non-critical upload fail a multi-hour run.
+    try:
+        tok.push_to_hub(ADAPTER_REPO, private=True, token=HF_TOKEN)
+    except Exception as e:
+        print(f"[push] tokenizer push to {ADAPTER_REPO} failed ({type(e).__name__}: {e}) - "
+              f"non-fatal, adapter itself already saved to {OUT}", flush=True)
 
 print("TRAINING_COMPLETE")
