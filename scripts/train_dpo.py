@@ -440,7 +440,7 @@ class DpoTrainer(Trainer):
             pc_ng = _logprob_sum(model, c_ids, c_am, c_lb)
             pr_ng = _logprob_sum(model, r_ids, r_am, r_lb)
 
-        if not DpoTrainer._step0_checked:
+        if not DpoTrainer._step0_checked and self.state.global_step == 0:
             # LoRA's B matrix is zero-initialized, so the adapter
             # contributes EXACTLY zero at init: policy and reference
             # log-probs SHOULD be identical on this very first call. A
@@ -448,7 +448,18 @@ class DpoTrainer(Trainer):
             # noise (different kernel paths, sums over ~1000+ tokens) from
             # a genuinely broken reference (disable_adapter() not taking
             # effect under FSDP wrapping - the plan's named risk).
-            DpoTrainer._step0_checked = True
+            #
+            # Gated on self.state.global_step == 0, NOT merely "first
+            # training_step call in this process" - confirmed on-GPU this
+            # matters: resuming from a checkpoint restores global_step to
+            # the checkpoint's step count, at which point the adapter is
+            # no longer a no-op (it has real trained deltas), so the old
+            # "first call this process" gating false-positived this
+            # assertion on EVERY resume (crashed a resume from
+            # checkpoint-12 with a genuine c_diff of 2.91, correctly
+            # divergent for a 12-step-trained adapter, misread as a
+            # broken reference model) - which would have broken every
+            # preemption recovery in the real run.
             c_diff = (pc_ng - ref_chosen_lp).abs().max().item()
             r_diff = (pr_ng - ref_rejected_lp).abs().max().item()
             print(f"[step0-check] |pol_chosen_lp - ref_chosen_lp|={c_diff:.6f} "
@@ -463,6 +474,7 @@ class DpoTrainer(Trainer):
                 f"(likely FSDP-wrapping issue) - the reference model is "
                 f"wrong. Set REF_LOGPROBS_PREPASS=1 and relaunch rather than "
                 f"continuing.")
+        DpoTrainer._step0_checked = True
 
         h = (pc_ng - ref_chosen_lp) - (pr_ng - ref_rejected_lp)
         loss = -torch.nn.functional.logsigmoid(DPO_BETA * h).mean()
