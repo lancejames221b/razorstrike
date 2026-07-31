@@ -342,14 +342,18 @@ case "$cmd" in
   create)
     echo "[gce] creating $VM_NAME ($GPU_COUNT x $GPU_TYPE, $MACHINE_TYPE, zone=$ZONE, preemptible=$PREEMPTIBLE)"
     extra_flags=()
-    if [ "$PREEMPTIBLE" = "1" ]; then extra_flags+=(--preemptible); fi
+    if [ "$PREEMPTIBLE" = "1" ]; then
+      extra_flags+=(--preemptible --no-restart-on-failure)
+    else
+      extra_flags+=(--restart-on-failure)
+    fi
     _gcloud compute instances create "$VM_NAME" \
       --project="$PROJECT" --zone="$ZONE" \
       --machine-type="$MACHINE_TYPE" \
       --accelerator="type=$GPU_TYPE,count=$GPU_COUNT" \
       --image-family="$IMAGE_FAMILY" --image-project="$IMAGE_PROJECT" \
       --boot-disk-size="$BOOT_DISK_SIZE" --boot-disk-type=pd-ssd \
-      --maintenance-policy=TERMINATE --restart-on-failure \
+      --maintenance-policy=TERMINATE \
       "${extra_flags[@]}"
     _bootstrap_and_launch
     ;;
