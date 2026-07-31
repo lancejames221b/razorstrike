@@ -509,15 +509,23 @@ class DpoTrainer(Trainer):
         return loss.detach()
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """EVAL-ONLY path. Trainer.evaluate() -> prediction_step() calls
-        this directly (never training_step), always under torch.no_grad()
-        - so the original combined 4-forward-pass form is safe here: no
-        graph is ever retained during eval regardless, which is exactly
-        why the OOM never happened at an eval boundary in earlier runs,
-        only inside training's backward. Do NOT remove this method: eval
-        will TypeError against the base Trainer's compute_loss (it expects
-        a model(**inputs) call with a `loss` output key, not this dataset's
-        chosen_*/rejected_* keys) the moment EVAL_STEPS is hit."""
+        """EVAL-ONLY path. Combined 4-forward-pass form is safe here: eval
+        always runs under torch.no_grad() (this method's own context
+        manager, and prediction_step below wraps it again), so no graph
+        is ever retained during eval regardless - exactly why the OOM
+        never happened at an eval boundary in earlier runs, only inside
+        training's backward. Reached via prediction_step's explicit call
+        below, NOT via Trainer's own has_labels routing (confirmed on-GPU
+        in the Step 2 smoke test: this dataset's batches carry no "labels"
+        key - only chosen_labels/rejected_labels - so Trainer.
+        prediction_step's has_labels/loss_without_labels branch always
+        picks the bare `model(**inputs)` path and ValueErrors ("must
+        specify exactly one of input_ids or inputs_embeds") the moment
+        EVAL_STEPS is hit; the prediction_step override is what actually
+        routes eval to this method). Do NOT remove this method: eval will
+        TypeError against the base Trainer's compute_loss (it expects
+        model(**inputs) to accept chosen_input_ids/rejected_input_ids
+        directly, not this dataset's key names) if this is deleted."""
         with torch.no_grad():
             c_ids, c_am, c_lb = (inputs["chosen_input_ids"], inputs["chosen_attention_mask"],
                                   inputs["chosen_labels"])
@@ -541,6 +549,18 @@ class DpoTrainer(Trainer):
         if return_outputs:
             return loss, {}
         return loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """Overridden: base Trainer.prediction_step's has_labels /
+        loss_without_labels branching never routes to compute_loss for
+        this dataset's chosen_*/rejected_* batch shape (confirmed on-GPU:
+        it falls through to a bare model(**inputs) call, which ValueErrors
+        since **inputs unpacks chosen_input_ids/rejected_input_ids, never
+        input_ids). Call compute_loss directly instead - args sets
+        prediction_loss_only=True, so no logits/labels are needed."""
+        with torch.no_grad():
+            loss = self.compute_loss(model, inputs)
+        return (loss.detach(), None, None)
 
 
 args = TrainingArguments(
