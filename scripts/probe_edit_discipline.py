@@ -47,8 +47,12 @@ def format_receipt(total):
     return f"Total: ${total:.2f}"
 '''
 
-# LIVE content: one blank-then-comment line inserted before apply_discount,
-# shifting every subsequent line number down by 2 from the stale view.
+# LIVE content: one blank-then-comment line inserted before apply_discount
+# (shifting every subsequent line number down by 2 from the stale view -
+# tests line-range discipline), AND calculate_total's own subtotal line
+# gained an inline comment (tests string-match discipline too - a stale
+# exact-string anchor copied from STALE_VIEW no longer matches here
+# either, so BOTH edit_file paths require a fresh read to succeed).
 LIVE_CONTENT = '''# NOTE: pricing module - keep in sync with docs/pricing.md
 
 def apply_discount(total, pct):
@@ -56,7 +60,7 @@ def apply_discount(total, pct):
 
 
 def calculate_total(items):
-    subtotal = sum(i["price"] * i["qty"] for i in items)
+    subtotal = sum(i["price"] * i["qty"] for i in items)  # raw subtotal
     return round(subtotal, 2)
 
 
