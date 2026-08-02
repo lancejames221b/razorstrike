@@ -2,6 +2,27 @@
 
 What's built/deployed, in-progress, decisions, and next steps. Update at every meaningful state change. See `REQ.md` for frozen requirements (base model, naming, scope, publish policy) — don't duplicate those here.
 
+## Status as of 2026-08-01 (v1.3 challenge-loop cycle, in progress)
+
+**Executing `hawq-v13-challenge-loop-plan.md`.** Deployed baseline is v1.2 (`hawq-sec-re-v12` GGUF on generic's 4090, `hawq-sec-re-v12-mlx` MLX on the Mac). v1.2's edit-discipline DPO training had **zero** measured effect — root cause: the training corpus taught prose commentary about anchors, but the eval metric (`probe_edit_discipline.py`) measures whether a `read_file` **tool call** precedes the first `edit_file` **tool call**. v1.3 retrains that behavior in the model's real tool-call surface form (see `REQ.md` for full frozen decision record once written; this file tracks live progress).
+
+**Constraint from user (2026-08-01): do NOT launch the 4x A100 GCE training run until the local pipeline (generator → corpus → preflight) is validated. User is actively using the generic 4090 (GGUF host) for other work — baseline/gate runs target `hawq-sec-re-v12-mlx` / `hawq-sec-re-v13-mlx` on the Mac (localhost:1234) only until told otherwise.**
+
+### Done this cycle
+- `scripts/eval_crypto_audit.py` — fixed the 2 invalid crypto-id fixtures (MD5 vs SHA-1 IV ambiguity; Blowfish-vs-hedge scoring) so the metric is real before baselining.
+- `scripts/probe_edit_discipline.py` — `probe_edit_discipline` now returns `(ok, read_before_first_edit, saw_any_read, saw_any_edit)`; added `probe_edit_reread` scenario (rejects first `edit_file`, checks the model re-reads rather than resubmitting identically).
+- `scripts/challenge_suite.py` (new) — battery runner across all 9 challenge families with per-trial `raw_text`/`tool_calls` capture, `lms ps` context-guard precondition, per-family error thresholds. Live-smoke-tested against `hawq-sec-re-v12-mlx` @ localhost:1234 (real HTTP calls, 2 trials, `read_before_first_edit_rate=0.5` observed).
+- `scripts/dpo_common.py` — `_ROLE_SPLIT_RE` now accepts a `tool` role (needed for tool-call-shaped DPO prompts); `torch` import made lazy (moved into `dpo_loss()`) so `preflight_dpo_maxlen.py` and other tokenizer-only consumers run without torch installed locally (this Mac has no local `torch`/`transformers` in system Python; `mlx_venv` has `transformers` only — verified working after the fix).
+- `scripts/build_edit_discipline_toolcall.py` (new) — generates 600 tool-call-shaped DPO pairs (300 `edit_toolcall_read_first` + 300 `edit_toolcall_reread_after_failure`), enforces anti-memorization assertions, zero probe-fixture contamination. Verified independently: 600 rows, correct source split, 600/600 `read_file` in chosen, 600/600 `edit_file` in rejected, 0 contamination hits.
+- `scripts/gce_cluster_train.sh` — threaded `DPO_BETA` through both launch branches (FSDP heredoc + non-FSDP `launch_cmd`), matching `MAX_PROMPT_LEN`'s existing mechanism. Prep-only — **no VM launched**.
+
+### In progress / next
+- Assemble+contaminate-check+preflight the 1000-row v1.3 corpus (600 new + 400 existing `clean_control`), stage to `gs://hawq-training-us-central1/datasets/hawq-dpo-v13/`.
+- Pre-register `docs/v1.3_gate_criteria.md` (must be committed before any training run).
+- Baseline the full 9-family battery against `hawq-sec-re-v12-mlx` (MLX only for now), write `docs/v1.3_baseline.md`.
+- **BLOCKED pending explicit user go-ahead:** GCE DPO training run (Step 9, `a2-highgpu-4g`, 4x A100) — held per the constraint above.
+
+### Prior cycle status (superseded, kept for history)
 ## Status as of 2026-07-24 09:14
 
 **Plan `hawq-coherent-eval-plan.md` is complete (21/21 tasks). Validation PASSED.**

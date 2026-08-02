@@ -226,7 +226,82 @@ def probe_edit_discipline(host, model):
     print(f"[edit_discipline] read_before_first_edit={read_before_first_edit} "
           f"saw_any_read={saw_any_read} saw_any_edit={saw_any_edit} "
           f"result={'PASS' if ok else 'FAIL'} ({why})", flush=True)
-    return ok
+    return ok, read_before_first_edit, saw_any_read, saw_any_edit
+
+
+def probe_edit_reread(host, model):
+    """Same stale-view/live-content setup as probe_edit_discipline, but the
+    harness force-rejects the model's FIRST edit_file call with
+    "edit failed: old_string not found in file" even when the old_string
+    would have matched. Metric reread_after_failure is True iff the model's
+    very next tool call (after that rejection, regardless of which turn it
+    lands in) is read_file rather than another edit_file. A byte-identical
+    resubmission of the rejected edit_file call sets
+    resubmitted_identical=True and always fails the metric."""
+    msgs = [
+        {"role": "system", "content": (
+            "You are a coding agent with read_file and edit_file tools. "
+            "You read pricing.py earlier in this session; its content was:\n\n"
+            f"{STALE_VIEW}\n\nNote: other processes in this environment may "
+            "modify files, so content you read earlier is not guaranteed to "
+            "still be current.")},
+        {"role": "user", "content": TASK},
+    ]
+    current_text = LIVE_CONTENT
+    final_text = None
+    first_edit_seen = False
+    rejected_call = None
+    awaiting_next = False
+    reread_after_failure = False
+    resubmitted_identical = False
+    for turn in range(6):
+        print(f"  [edit_reread] turn {turn+1}/6", flush=True)
+        reasoning, content, finish, ctoks, api_tcs = generate(
+            host, model, msgs, max_tokens=3000, tools=TOOLS)
+        tcs = normalize_tool_calls(api_tcs, content)
+        assistant_msg = {"role": "assistant", "content": content}
+        if api_tcs:
+            assistant_msg["tool_calls"] = api_tcs
+        msgs.append(assistant_msg)
+        if not tcs:
+            break
+        for i, tc in enumerate(tcs):
+            name = tc.get("name", "")
+            args = tc.get("arguments", {}) or {}
+            call_id = (api_tcs[i].get("id") if i < len(api_tcs) and api_tcs[i].get("id")
+                       else f"call_{turn}_{i}")
+            if awaiting_next:
+                awaiting_next = False
+                if (name, args) == rejected_call:
+                    resubmitted_identical = True
+                    reread_after_failure = False
+                else:
+                    reread_after_failure = (name == "read_file")
+            if name == "read_file":
+                result = current_text
+            elif name == "edit_file":
+                if not first_edit_seen:
+                    first_edit_seen = True
+                    rejected_call = (name, args)
+                    awaiting_next = True
+                    result = "edit failed: old_string not found in file"
+                else:
+                    new_text, msg = apply_edit(current_text, args)
+                    if new_text is not None:
+                        current_text = new_text
+                        final_text = current_text
+                    result = msg if new_text is None else f"{msg}\n\n{new_text}"
+            else:
+                result = "unknown tool"
+            msgs.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result)})
+        if final_text is not None:
+            break
+
+    ok, why = grade(final_text)
+    print(f"[edit_reread] reread_after_failure={reread_after_failure} "
+          f"resubmitted_identical={resubmitted_identical} "
+          f"result={'PASS' if ok else 'FAIL'} ({why})", flush=True)
+    return ok, reread_after_failure, resubmitted_identical
 
 
 def main():
@@ -235,7 +310,7 @@ def main():
     ap.add_argument("--model", default="hawq-sec-re-v12")
     args = ap.parse_args()
     print(f"\n=== EDIT DISCIPLINE PROBE: {args.model} @ {args.host} ===\n", flush=True)
-    ok = probe_edit_discipline(args.host, args.model)
+    ok, *_ = probe_edit_discipline(args.host, args.model)
     print(f"OVERALL: {'PASS' if ok else 'FAIL'}", flush=True)
     sys.exit(0 if ok else 1)
 

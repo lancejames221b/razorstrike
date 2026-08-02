@@ -31,13 +31,15 @@ temperature stays 0 (minimizes, does not eliminate, variance); majority-of-K
 is what makes the number trustworthy. --out JSON records k and the raw
 per-run results alongside the majority verdict.
 
-probe_crypto_id's other_hit (the "did it also name a different algorithm"
-shotgunning guard) is scored against the FINAL ANSWER (`content`) only, not
-the reasoning trace: a reasoning model legitimately weighs and discards
+probe_crypto_id scores each case by the FIRST known-algorithm alias
+(word-boundary match) to appear in the FINAL ANSWER (`content`), not the
+reasoning trace: a reasoning model legitimately weighs and discards
 alternatives ("is this AES's sbox? no... matches SHA-256's K table") before
 answering, and scanning that trace for competitor names would penalize
 *better* reasoning as a false positive -- confirmed empirically against this
-model's raw completions.
+model's raw completions. A hedged-but-correct lead ("Blowfish (or TEA)")
+still PASSes as long as the expected algorithm is named first; naming no
+known algorithm alias at all still FAILs.
 
 Usage:
     python3 scripts/eval_crypto_audit.py --host 127.0.0.1:1234 \
@@ -173,7 +175,13 @@ unsigned int mix_round(unsigned int a, unsigned int b, int i) {
     h[1] = 0xefcdab89;
     h[2] = 0x98badcfe;
     h[3] = 0x10325476;
-}""",
+}
+
+static const unsigned int K[4] = {
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee
+};
+
+static const int S[4] = {7, 12, 17, 22};""",
     ),
     "TEA": (
         ("tea",),
@@ -201,8 +209,34 @@ unsigned int perturb(unsigned int x, int i) {
 
 _ALL_ALIASES = {name: aliases for name, (aliases, _) in _CRYPTO_ID_CASES.items()}
 
+_ALIAS_RE_CACHE = {}
 
-def _crypto_id_case_once(host, model, name, aliases, code):
+
+def _alias_pattern(alias):
+    pat = _ALIAS_RE_CACHE.get(alias)
+    if pat is None:
+        pat = re.compile(r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])")
+        _ALIAS_RE_CACHE[alias] = pat
+    return pat
+
+
+def _first_algorithm_hit(content_lower):
+    """Return the case name whose alias is the first (word-boundary) match
+    in content_lower, or None if no known algorithm alias appears at all."""
+    best_name = None
+    best_index = None
+    for other_name, other_aliases in _ALL_ALIASES.items():
+        for alias in other_aliases:
+            m = _alias_pattern(alias).search(content_lower)
+            if m is None:
+                continue
+            if best_index is None or m.start() < best_index:
+                best_index = m.start()
+                best_name = other_name
+    return best_name
+
+
+def _crypto_id_case_once(host, model, name, code):
     msgs = [
         {"role": "system", "content": "You are a reverse engineer identifying "
          "cryptographic primitives from decompiled/obfuscated C code."},
@@ -211,24 +245,21 @@ def _crypto_id_case_once(host, model, name, aliases, code):
          f"the algorithm and a brief justification.\n\n```c\n{code}\n```"},
     ]
     reasoning, content, finish, ctoks, _ = generate(host, model, msgs, max_tokens=4000)
-    text = _full_text(reasoning, content)
     content_lower = (content or "").lower()
-    own_hit = any(a.lower() in text for a in aliases)
-    # Scored against the FINAL ANSWER only -- see module docstring.
-    other_hit = any(
-        any(a.lower() in content_lower for a in other_aliases)
-        for other_name, other_aliases in _ALL_ALIASES.items()
-        if other_name != name
-    )
-    return own_hit and not other_hit
+    # Scored against the FINAL ANSWER only -- see module docstring. PASS iff
+    # the first algorithm alias (word-boundary match) named in the final
+    # answer is this case's expected algorithm; a hedged-but-correct lead
+    # ("Blowfish (or TEA)") still PASSes, and naming no known algorithm
+    # alias at all still FAILs.
+    return _first_algorithm_hit(content_lower) == name
 
 
 def probe_crypto_id(host, model, k=K_DEFAULT):
     per_case = {}
     raw = {}
     correct = 0
-    for name, (aliases, code) in _CRYPTO_ID_CASES.items():
-        runs = [_crypto_id_case_once(host, model, name, aliases, code) for _ in range(k)]
+    for name, (_aliases, code) in _CRYPTO_ID_CASES.items():
+        runs = [_crypto_id_case_once(host, model, name, code) for _ in range(k)]
         ok = _majority(runs)
         per_case[name] = ok
         raw[name] = runs

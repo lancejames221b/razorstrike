@@ -18,9 +18,8 @@ serving path never exercises.
 """
 import re
 
-import torch
 
-_ROLE_SPLIT_RE = re.compile(r'(?:^|\n\n)\[(system|user|assistant)\]\n')
+_ROLE_SPLIT_RE = re.compile(r'(?:^|\n\n)\[(system|user|assistant|tool)\]\n')
 _WARNED = {"once": False}
 
 
@@ -29,7 +28,10 @@ def dpo_loss(pol_chosen_lp, pol_rejected_lp, ref_chosen_lp, ref_rejected_lp, bet
     per-token log-probs over the response span. Shared by
     scripts/train_dpo.py (real training) and scripts/test_dpo_loss.py (unit
     tests) so the tests validate the exact function that runs on the A100,
-    not a duplicate copy."""
+    not a duplicate copy. Imports torch lazily so modules that only need
+    parse_prompt_to_messages/truncate_messages_to_budget (e.g.
+    preflight_dpo_maxlen.py) can run without torch installed."""
+    import torch
     logits = (pol_chosen_lp - ref_chosen_lp) - (pol_rejected_lp - ref_rejected_lp)
     return -torch.nn.functional.logsigmoid(beta * logits).mean()
 
@@ -153,7 +155,19 @@ def truncate_messages_to_budget(messages, tok, max_prompt_tokens):
         return len(tok(content, add_special_tokens=False)["input_ids"]) + \
             TEMPLATE_OVERHEAD_PER_TURN
 
-    system_msgs = [m for m in messages if m["role"] == "system"]
+    # Coalesced, not just collected: the chat template only permits a
+    # system/developer message at position 0 (chat_template.jinja raises
+    # "System message must be at the beginning." for any later one) - a
+    # window with 2+ system-mapped entries (omp's mid-session `developer`
+    # reminders map to "system"; long agentic runs commonly have several)
+    # would crash apply_chat_template otherwise. Merging preserves every
+    # system message's content instead of silently dropping the extras.
+    _system_msgs_raw = [m for m in messages if m["role"] == "system"]
+    if len(_system_msgs_raw) > 1:
+        system_msgs = [{"role": "system",
+                         "content": "\n\n".join(m["content"] for m in _system_msgs_raw)}]
+    else:
+        system_msgs = _system_msgs_raw
     turn_msgs = _merge_consecutive_same_role(
         [m for m in messages if m["role"] != "system"])
 
