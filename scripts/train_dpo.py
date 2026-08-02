@@ -799,7 +799,13 @@ if _FSDP:
         del trainer.optimizer
     gc.collect()
     torch.cuda.empty_cache()
-    trainer.save_model(OUT)
+    # Missing before this fix: without switching off the training-time
+    # SHARDED_STATE_DICT, trainer.save_model(OUT) silently wrote nothing
+    # usable at OUT (no adapter_config.json/adapter_model.safetensors) -
+    # confirmed on the v1.3 run (checkpoint-N/ dirs existed, OUT did not).
+    # train_lora.py's equivalent block already does this; mirror it here.
+    trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
+    trainer.save_model(OUT)      # FSDP-aware state-dict gather, all ranks
 
 if trainer.is_world_process_zero():
     if not _FSDP:
