@@ -14,9 +14,13 @@ Env: BASE_REPO (default Qwen/Qwen3.6-35B-A3B), ADAPTER_DIR (/content/adapter),
 """
 
 import os
+import sys
 import torch
 from transformers import AutoModelForImageTextToText, AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from model_card_defaults import MODEL_CARD_SAMPLING_SECTION, write_generation_config
 
 BASE         = os.environ.get("BASE_REPO", "lancejames221b/HAWQ-v1")
 ADAPTER_DIR  = os.environ.get("ADAPTER_DIR", "/content/adapter")
@@ -58,6 +62,7 @@ x86-64 assembly (purpose, I/O, algorithm, security-relevant behavior).
 - 4x A100 FSDP, 2 epochs, MAXLEN=4096, r=64/alpha=128, attention+SSM target
   modules
 
+{MODEL_CARD_SAMPLING_SECTION}
 ## License
 
 Released under **Apache 2.0**, matching the {BASE} base model.
@@ -170,6 +175,10 @@ def main():
     m.save_pretrained(MERGED_DIR, safe_serialization=True, max_shard_size="5GB")
     tok = AutoTokenizer.from_pretrained(BASE)
     tok.save_pretrained(MERGED_DIR)
+
+    gc_path = write_generation_config(MERGED_DIR)
+    print(f"[merge] wrote {gc_path} with pinned sampling defaults "
+          f"(temp 0.6/top_p .95/top_k 20/repetition_penalty 1.0)", flush=True)
 
     with open(os.path.join(MERGED_DIR, "README.md"), "w") as f:
         f.write(MODEL_CARD)

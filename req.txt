@@ -93,6 +93,15 @@ the same gotchas each time.
    - See gguf-qwen35moe-lora-deploy-lmstudio /
      hawq-v1-gguf-conversion-gotchas skills for the MTP block_count+1 fix
      and tokenizer-file gotchas specific to this arch's GGUF conversion.
+   - **generation_config.json + README sampling/system-prompt section must
+     survive quantization.** `merge_push.py` now writes both from
+     `scripts/model_card_defaults.py` into the pre-quantize checkpoint, but
+     MLX/GGUF conversion tooling has clobbered the README before (folder
+     upload overwrote it with an mlx_vlm autogen stub - see git history).
+     After each MLX/GGUF push, diff the live repo's README and
+     generation_config.json against `model_card_defaults.py`'s
+     `MODEL_CARD_SAMPLING_SECTION` / `GENERATION_CONFIG_OVERRIDES`; re-apply
+     from that module (single source of truth) if either was stomped.
 
 6. EVAL GATE (before any public push)
    - Pre-register gate criteria in a docs/*.md file BEFORE running the
