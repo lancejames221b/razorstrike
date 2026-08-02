@@ -88,6 +88,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from omp_surface import render_tool_calls  # noqa: E402
+from dpo_common import parse_prompt_to_messages  # noqa: E402
 
 # Explicit certifi CA bundle rather than relying on ssl.get_default_verify_paths():
 # confirmed in this environment that a bash-tool interactive shell and a
@@ -360,6 +361,17 @@ def collect_candidates(root, window_n):
                 stats["empty_rejected"] += 1
                 continue
             window = build_window(rentries, ridx, window_n)
+            if not any(m["role"] == "user" for m in parse_prompt_to_messages(window)):
+                # No preceding user turn anywhere in this session's history
+                # (build_window's own walk-back exhausted `rentries` without
+                # finding one). dpo_common.truncate_messages_to_budget drops
+                # any row with zero user turns unconditionally (the chat
+                # template cannot render a prompt with none) - this
+                # candidate can NEVER survive preflight regardless of
+                # window_n, so exclude it here, before paying for frontier
+                # generation, instead of generating and dropping it later.
+                stats["dropped_no_user_turn"] += 1
+                continue
             dedup_key = (severity, body, rejected)
             if dedup_key in seen_dedup:
                 stats["dedup_dropped"] += 1
@@ -669,6 +681,7 @@ def main():
           f"empty_advisory_body={scan_stats['empty_advisory_body']} "
           f"dropped_write_fallback={scan_stats['dropped_write_fallback']} "
           f"empty_rejected={scan_stats['empty_rejected']} "
+          f"dropped_no_user_turn={scan_stats['dropped_no_user_turn']} "
           f"dedup_dropped={scan_stats['dedup_dropped']}")
     print(f"[scan] {scan_stats['unique_candidates']} unique candidates "
           f"after resolution + dedup")
